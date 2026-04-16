@@ -1,6 +1,6 @@
 const { chromium } = require('playwright');
 
-const RSI_LOGIN_URL = 'https://robertsspaceindustries.com/account/login';
+const RSI_HOME_URL = 'https://robertsspaceindustries.com';
 
 async function scrapeOrgMembers(orgName) {
   const email = process.env.RSI_EMAIL;
@@ -11,47 +11,84 @@ async function scrapeOrgMembers(orgName) {
   }
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
 
   try {
-    // Login
-    console.log('[scraper] Navigating to login page...');
-    await page.goto(RSI_LOGIN_URL, { waitUntil: 'networkidle' });
+    // Load homepage
+    console.log('[scraper] Navigating to RSI homepage...');
+    await page.goto(RSI_HOME_URL, { waitUntil: 'networkidle' });
 
+    // Accept cookies so consent is stored
+    try {
+      const allowAll = page.locator('button', { hasText: 'Allow all cookies' });
+      if (await allowAll.isVisible({ timeout: 5000 })) {
+        await allowAll.click();
+        await page.waitForLoadState('networkidle');
+        console.log('[scraper] Cookie consent accepted.');
+      }
+    } catch {}
+
+    // Open login modal
+    console.log('[scraper] Opening sign-in modal...');
+    await page.locator('button.a-navigationButton', { hasText: /sign.?in/i }).first().click();
+    await page.waitForSelector('input[type="text"]:visible', { timeout: 10000 });
+
+    // Fill credentials
     console.log('[scraper] Filling in credentials...');
-    await page.fill('input[name="email"]', email);
-    await page.fill('input[name="password"]', password);
-    await page.click('button[type="submit"]');
+    await page.fill('input[type="text"]:visible', email);
+    await page.fill('input[type="password"]:visible', password);
 
-    console.log('[scraper] Waiting for login to complete...');
-    await page.waitForNavigation({ waitUntil: 'networkidle' });
+    // Submit
+    console.log('[scraper] Submitting login...');
+    await page.locator('button', { hasText: /sign.?in/i }).last().click();
+    await page.waitForLoadState('networkidle');
+    console.log('[scraper] Login submitted. Current URL:', page.url());
 
     // Navigate to org members page
-    const membersUrl = `https://robertsspaceindustries.com/orgs/${orgName}/members`;
+    const membersUrl = `${RSI_HOME_URL}/orgs/${orgName}/members`;
     console.log(`[scraper] Navigating to ${membersUrl}...`);
     await page.goto(membersUrl, { waitUntil: 'networkidle' });
 
-    console.log('[scraper] Waiting for member list to load...');
-    await page.waitForSelector('.members-list', { timeout: 15000 }).catch(() => {
-      console.warn('[scraper] .members-list selector not found, attempting extraction anyway...');
+    // Wait for members to render
+    console.log('[scraper] Waiting for member list...');
+    await page.waitForSelector('[class*="member"]', { timeout: 15000 }).catch(() => {
+      console.warn('[scraper] Member selector not found, attempting extraction anyway...');
     });
 
-    // Extract member names and ranks
+    // Extract members
     console.log('[scraper] Extracting members...');
     const members = await page.evaluate(() => {
+      const clean = (str) => str.replace(/\s+/g, ' ').trim();
+
+      const seen = new Set();
       const results = [];
-      const cards = document.querySelectorAll('.member-item, .members-list .member, [class*="member"]');
 
-      cards.forEach((card) => {
-        const name =
-          card.querySelector('[class*="name"], [class*="handle"], .nick')?.textContent?.trim() || '';
-        const rank =
-          card.querySelector('[class*="rank"], [class*="role"], .rank')?.textContent?.trim() || '';
+      // Target individual member cards only (not parent wrappers)
+      const cards = document.querySelectorAll('[class*="member-item"], [class*="memberItem"], [class*="member_item"]');
 
-        if (name) {
-          results.push({ name, rank });
-        }
+      // Fallback: use all [class*="member"] but deduplicate by handle
+      const targets = cards.length > 0 ? cards : document.querySelectorAll('[class*="member"]');
+
+      targets.forEach((card) => {
+        const nameEl = card.querySelector('[class*="name"], [class*="handle"], [class*="nick"]');
+        const rankEl = card.querySelector('[class*="rank"], [class*="role"]');
+
+        if (!nameEl) return;
+
+        // Name: first non-empty token (display name)
+        const nameParts = nameEl.textContent.split('\n').map(clean).filter(Boolean);
+        const name = nameParts[0] || '';
+        if (!name || seen.has(name)) return;
+        seen.add(name);
+
+        // Rank: filter out "Roles" label, join actual roles
+        const rankParts = rankEl
+          ? rankEl.textContent.split('\n').map(clean).filter((s) => s && s !== 'Roles')
+          : [];
+        const rank = rankParts.join(', ') || 'Member';
+
+        results.push({ name, rank });
       });
 
       return results;
