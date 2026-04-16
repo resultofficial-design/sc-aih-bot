@@ -160,6 +160,9 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
 async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
   console.log('[sync] Starting sync...');
 
+  // TEMPORARY: delay to test progress message
+  await new Promise(resolve => setTimeout(resolve, 7000));
+
   let freshMembers;
   try {
     freshMembers = await scrapeOrgMembers(process.env.ORG_NAME);

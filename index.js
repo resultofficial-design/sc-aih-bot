@@ -137,23 +137,25 @@ client.on(Events.MessageCreate, async (message) => {
     let progressMessage = null;
     let syncDone = false;
 
-    // Send a "Still running..." message after 5 seconds if sync isn't done yet
+    // Send "Still running..." only if sync takes longer than 3 seconds
+    console.log('[SYNC] Timer started');
     const progressTimer = setTimeout(async () => {
+      console.log('[SYNC] Timer fired');
       if (!syncDone) {
         try {
           progressMessage = await message.channel.send('Still running...');
-        } catch {
-          // Channel may be unavailable — ignore
+        } catch (err) {
+          console.log('Failed to send progress message:', err.message);
         }
       }
-    }, 5000);
+    }, 3000);
 
     const safeDelete = async (msg) => {
       if (!msg) return;
       try { await msg.delete(); } catch { /* already deleted or no permission */ }
     };
 
-    const buildSummary = (summary) => {
+    const buildSummary = (summary, elapsedSec) => {
       const hasChanges =
         summary.usersUpdated > 0 ||
         summary.rolesAdded > 0 ||
@@ -161,30 +163,36 @@ client.on(Events.MessageCreate, async (message) => {
         summary.rolesCreated > 0 ||
         summary.autoLinked.length > 0;
 
-      if (!hasChanges) return 'Sync complete. No changes were needed.';
+      const footer = `\n⏱ Completed in **${elapsedSec}s**`;
+
+      if (!hasChanges) return `✅ Sync complete. No changes were needed.${footer}`;
 
       const lines = [
-        'Sync complete:',
-        `- **${summary.usersUpdated}** users processed`,
-        `- **${summary.rolesAdded}** roles assigned`,
-        `- **${summary.rolesRemoved}** roles removed`,
-        `- **${summary.rolesCreated}** new roles created`,
-        `- **${summary.autoLinked.length}** users auto-linked`,
+        '✅ **Sync complete**',
+        '',
+        `👥 Users processed: **${summary.usersUpdated}**`,
+        `➕ Roles assigned:  **${summary.rolesAdded}**`,
+        `➖ Roles removed:   **${summary.rolesRemoved}**`,
+        `🆕 Roles created:   **${summary.rolesCreated}**`,
+        `🔗 Auto-linked:     **${summary.autoLinked.length}**`,
       ];
 
       if (summary.needsReview.length > 0) {
-        lines.push(`- **${summary.needsReview.length}** DMs sent for confirmation`);
+        lines.push(`📨 DMs sent:        **${summary.needsReview.length}**`);
       }
       if (summary.unmatched.length > 0) {
-        lines.push(`- **${summary.unmatched.length}** unmatched: ${summary.unmatched.map((u) => `\`${u.rsiHandle}\` (${u.reason})`).join(', ')}`);
+        lines.push(`⚠️ Unmatched:       **${summary.unmatched.length}** — ${summary.unmatched.map((u) => `\`${u.rsiHandle}\` (${u.reason})`).join(', ')}`);
       }
 
+      lines.push(footer);
       return lines.join('\n');
     };
 
     try {
       console.log('Running sync function...');
+      const syncStart = Date.now();
       const summary = await runSync(message.guild, membersRef, pendingDmConfirmations);
+      const elapsedSec = ((Date.now() - syncStart) / 1000).toFixed(1);
 
       syncDone = true;
       clearTimeout(progressTimer);
@@ -194,11 +202,11 @@ client.on(Events.MessageCreate, async (message) => {
 
       if (summary.error) {
         console.error(`[sync] Failed: ${summary.error}`);
-        return message.channel.send(`Sync failed: ${summary.error}`);
+        return message.channel.send(`❌ Sync failed: ${summary.error}`);
       }
 
-      const reply = buildSummary(summary);
-      console.log(`[sync] ${reply.replace(/\*\*/g, '')}`);
+      const reply = buildSummary(summary, elapsedSec);
+      console.log(`[sync] ${reply.replace(/\*\*/g, '').replace(/[✅➕➖🆕🔗📨⚠️⏱👥]/g, '').trim()}`);
       return message.channel.send(reply);
 
     } catch (err) {
