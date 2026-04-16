@@ -97,7 +97,6 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
     const candidates = [];
     guild.members.cache.forEach((member) => {
       if (member.user.bot) return;
-      if (verifiedUsers[member.id]) return;
 
       const usernameScore = similarity(member.user.username, rsiName);
       const nicknameScore = similarity(member.nickname || '', rsiName);
@@ -163,34 +162,32 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
 
     if (!winner) continue;
 
-    const pct = (winner.bestScore * 100).toFixed(1);
+    // Enforce winner — score no longer gates assignment
+    setUser(winner.discordId, rsiName);
+    const rolesAdded = await assignRanks(guild, winner.discordMember, orgMember);
+    await updateNickname(guild, winner.discordMember, rsiName);
 
-    if (winner.bestScore >= AUTO_LINK_THRESHOLD) {
-      // Strong match — auto-link
-      setUser(winner.discordId, rsiName);
-      const rolesAdded = await assignRanks(guild, winner.discordMember, orgMember);
-      await updateNickname(guild, winner.discordMember, rsiName);
+    console.log(`[FIX] Winner enforced: ${winner.discordMember.user.tag} → RSI: ${rsiName} (score: ${winner.bestScore.toFixed(2)}) — ${rolesAdded} role(s) assigned`);
+    autoLinked.push({ discordTag: winner.discordMember.user.tag, rsiHandle: rsiName, score: (winner.bestScore * 100).toFixed(1) });
 
-      console.log(
-        `[UNVERIFIED] Auto-linked ${winner.discordMember.user.tag} → RSI: ${rsiName} (${pct}%) — ${rolesAdded} role(s) assigned`
-      );
-      autoLinked.push({ discordTag: winner.discordMember.user.tag, rsiHandle: rsiName, score: pct });
-
-    } else if (winner.bestScore >= REVIEW_THRESHOLD) {
-      // Medium match — send DM confirmation
-      try {
-        const dmChannel = await winner.discordMember.user.createDM();
-        await dmChannel.send(
-          `Hi! We found a possible match between your Discord account and the RSI org **${process.env.ORG_NAME}**.\n\n` +
-          `Is your RSI handle **${rsiName}**?\n\n` +
-          `Reply \`yes\` to link your account and receive your roles, or \`no\` to dismiss.`
-        );
-        pendingDmConfirmations.set(winner.discordId, { rsiHandle: rsiName, orgMember, guildId: guild.id });
-        console.log(`[UNVERIFIED] DM sent to ${winner.discordMember.user.tag} — possible RSI match: ${rsiName} (${pct}%)`);
-      } catch (err) {
-        console.warn(`[UNVERIFIED] Could not DM ${winner.discordMember.user.tag}: ${err.message}`);
+    // Handle losers immediately
+    const losers = candidates.filter((c) => c.discordId !== winner.discordId);
+    for (const loser of losers) {
+      for (const role of loser.discordMember.roles.cache.values()) {
+        if (isManagedRole(role.id)) {
+          try {
+            await loser.discordMember.roles.remove(role);
+          } catch (err) {
+            console.warn(`[UNVERIFIED] Could not remove role "${role.name}" from ${loser.discordMember.user.tag}: ${err.message}`);
+          }
+        }
       }
-      needsReview.push({ discordTag: winner.discordMember.user.tag, rsiHandle: rsiName, score: pct });
+      try {
+        await loser.discordMember.setNickname('⚠️ Unverified', 'Conflict resolution — imposter detected');
+      } catch (err) {
+        console.warn(`[UNVERIFIED] Could not rename ${loser.discordMember.user.tag}: ${err.message}`);
+      }
+      console.log(`[UNVERIFIED] Loser handled: ${loser.discordMember.user.tag}`);
     }
   }
 
