@@ -1,0 +1,16 @@
+{
+  "name": "sc-ia-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for SC-IA",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7",
+    "playwright": "^1.59.1"
+  }
+}
