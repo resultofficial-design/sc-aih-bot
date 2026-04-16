@@ -140,12 +140,14 @@ async function extractMembers(page, orgName) {
     console.log(`[scraper] Extracted members after retry: ${members.length}`);
   }
 
-  console.log('[SYNC DEBUG] Members length:', members.length);
+  console.log('[SYNC DEBUG] Members length:', members?.length);
 
   if (!members || members.length === 0) {
-    throw new Error('No members found after extraction');
+    console.warn('[SYNC] No members found after scraping');
+    throw new Error('No members found');
   }
 
+  console.log('[SYNC] Proceeding with sync using', members.length, 'members');
   return members;
 }
 

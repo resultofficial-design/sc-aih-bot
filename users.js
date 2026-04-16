@@ -27,4 +27,14 @@ function getUser(discordId) {
   return data[discordId] || null;
 }
 
-module.exports = { load, setUser, getUser };
+// Returns the Discord ID that already owns this RSI handle, or null if unclaimed
+function getUserByHandle(rsiHandle) {
+  const data = load();
+  const lower = rsiHandle.toLowerCase();
+  for (const [discordId, handle] of Object.entries(data)) {
+    if (handle.toLowerCase() === lower) return discordId;
+  }
+  return null;
+}
+
+module.exports = { load, setUser, getUser, getUserByHandle };

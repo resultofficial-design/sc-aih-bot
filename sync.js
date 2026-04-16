@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { scrapeOrgMembers } = require('./scraper');
 const { ensureRole, isManagedRole } = require('./roles');
-const { load, setUser } = require('./users');
+const { load, setUser, getUserByHandle } = require('./users');
 const { findBestMatchRaw } = require('./fuzzy');
 const { updateNickname } = require('./nicknames');
 
@@ -114,7 +114,13 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
     const pct = (score * 100).toFixed(1);
 
     if (score >= AUTO_LINK_THRESHOLD) {
-      // Strong match — auto-link immediately
+      // Strong match — auto-link, but only if handle isn't already claimed
+      const existingOwner = getUserByHandle(match);
+      if (existingOwner && existingOwner !== discordId) {
+        console.warn(`[sync] Skipping auto-link for ${discordMember.user.tag} — RSI handle "${match}" already claimed by Discord ID ${existingOwner}`);
+        continue;
+      }
+
       setUser(discordId, match);
       const orgMember = freshMembers.find((m) => m.name === match);
       const rolesAdded = await assignRanks(guild, discordMember, orgMember);
@@ -125,7 +131,13 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
       autoLinked.push({ discordTag: discordMember.user.tag, rsiHandle: match, score: pct });
 
     } else if (score >= REVIEW_THRESHOLD) {
-      // Medium match — send DM asking for confirmation
+      // Medium match — send DM, but only if handle isn't already claimed
+      const existingOwner = getUserByHandle(match);
+      if (existingOwner && existingOwner !== discordId) {
+        console.warn(`[sync] Skipping DM for ${discordMember.user.tag} — RSI handle "${match}" already claimed by Discord ID ${existingOwner}`);
+        continue;
+      }
+
       const orgMember = freshMembers.find((m) => m.name === match);
 
       try {
@@ -161,12 +173,25 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
   try {
     freshMembers = await scrapeOrgMembers(process.env.ORG_NAME);
     console.log(`[sync] Fetched ${freshMembers.length} org members.`);
+    cachedMembersRef.members = freshMembers;
   } catch (err) {
-    console.error('[sync] Scraping failed, aborting sync:', err.message);
-    return { error: err.message };
+    if (cachedMembersRef.members.length > 0) {
+      console.warn(`[sync] Scraping failed (${err.message}) — falling back to ${cachedMembersRef.members.length} cached members.`);
+      freshMembers = cachedMembersRef.members;
+    } else {
+      console.error('[sync] Scraping failed and no cached members available:', err.message);
+      return { error: err.message };
+    }
   }
 
-  cachedMembersRef.members = freshMembers;
+  console.log('[SYNC] Members received:', freshMembers.length);
+
+  if (!freshMembers || freshMembers.length === 0) {
+    console.warn('[SYNC] No members found — aborting sync');
+    return { error: 'No members found', usersUpdated: 0, rolesAdded: 0, rolesRemoved: 0, rolesCreated: 0, autoLinked: [], needsReview: [], unmatched: [] };
+  }
+
+  console.log('[SYNC] Proceeding with sync using', freshMembers.length, 'members');
 
   // Ensure all org ranks exist as Discord roles, count newly created ones
   await guild.roles.fetch();
@@ -209,6 +234,7 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
     `new roles created: ${rolesCreated}, auto-linked: ${autoLinked.length}, ` +
     `DMs sent: ${needsReview.length}, unmatched: ${unmatched.length}`
   );
+  console.log('[SYNC] Sync completed successfully');
 
   return summary;
 }

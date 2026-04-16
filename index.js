@@ -1,7 +1,8 @@
+console.log("=== THIS IS THE NEW BOT VERSION ===");
 const { Client, GatewayIntentBits, Events, ChannelType } = require('discord.js');
 const config = require('./config');
 const { scrapeOrgMembers } = require('./scraper');
-const { load, setUser, getUser } = require('./users');
+const { load, setUser, getUser, getUserByHandle } = require('./users');
 const { syncRoles, assignRoleToMember } = require('./roles');
 const { findBestMatchRaw } = require('./fuzzy');
 const { runSync, scheduleWeeklySync } = require('./sync');
@@ -25,7 +26,17 @@ const pendingConfirmations = new Map();
 // Pending DM confirmations (auto-match from sync): discordId → { rsiHandle, orgMember, guildId }
 const pendingDmConfirmations = new Map();
 
+// Prevent concurrent !sync runs
+let isSyncing = false;
+
 async function completeVerification(message, rsiHandle, orgMember) {
+  // Block if this RSI handle is already claimed by a different Discord user
+  const existingOwner = getUserByHandle(rsiHandle);
+  if (existingOwner && existingOwner !== message.author.id) {
+    console.log(`[verify] Handle "${rsiHandle}" already claimed by Discord ID ${existingOwner} — blocking ${message.author.tag}`);
+    return message.reply(`That RSI handle is already linked to another account. Please contact a server admin.`);
+  }
+
   setUser(message.author.id, rsiHandle);
 
   if (orgMember && message.guild) {
@@ -74,10 +85,13 @@ client.once(Events.ClientReady, async (readyClient) => {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
-  console.log('Message received:', message.content);
+  console.log('[DEBUG] messageCreate triggered:', message.content);
 
   const content = message.content.trim();
   const cmd = content.toLowerCase();
+
+  // Ignore messages that aren't commands
+  if (!content.startsWith('!')) return;
   const isDM = message.channel.type === ChannelType.DM;
 
   // --- DM reply handler (auto-match confirmation from sync) ---
@@ -130,10 +144,15 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   // !sync — manual sync trigger
-  if (cmd.startsWith('!sync')) {
-    console.log('Sync command detected');
+  if (cmd === '!sync') {
+    console.log('[DEBUG] Sync command detected');
 
-    let startMessage = await message.reply('Sync started...');
+    if (isSyncing) {
+      return message.reply('⏳ Sync is already running. Please wait for it to finish.');
+    }
+
+    isSyncing = true;
+    let startMessage = await message.reply('SYNC FROM NEW VERSION');
     let progressMessage = null;
     let syncDone = false;
 
@@ -202,12 +221,12 @@ client.on(Events.MessageCreate, async (message) => {
 
       if (summary.error) {
         console.error(`[sync] Failed: ${summary.error}`);
-        return message.channel.send(`❌ Sync failed: ${summary.error}`);
+        return message.reply(`❌ Sync failed: ${summary.error}`);
       }
 
       const reply = buildSummary(summary, elapsedSec);
       console.log(`[sync] ${reply.replace(/\*\*/g, '').replace(/[✅➕➖🆕🔗📨⚠️⏱👥]/g, '').trim()}`);
-      return message.channel.send(reply);
+      return message.reply(reply);
 
     } catch (err) {
       syncDone = true;
@@ -217,7 +236,9 @@ client.on(Events.MessageCreate, async (message) => {
       await safeDelete(progressMessage);
 
       console.error('Sync error:', err);
-      return message.channel.send(`Sync failed: ${err.message}`);
+      return message.reply(`Sync failed: ${err.message}`);
+    } finally {
+      isSyncing = false;
     }
   }
 
@@ -234,6 +255,14 @@ client.on(Events.MessageCreate, async (message) => {
     if (answer === 'no' || answer === 'n') {
       pendingConfirmations.delete(message.author.id);
       return message.reply('Verification cancelled. Please try `!verify <RSI_HANDLE>` again with the correct name.');
+    }
+
+    // User issued a new !verify — clear old pending and let it proceed
+    if (cmd.startsWith('!verify ')) {
+      pendingConfirmations.delete(message.author.id);
+    } else {
+      // Any other input while a confirmation is pending — re-prompt, do not fall through
+      return message.reply('Please reply with `yes` or `no`.');
     }
   }
 
