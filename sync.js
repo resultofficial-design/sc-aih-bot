@@ -2,8 +2,9 @@ const cron = require('node-cron');
 const { scrapeOrgMembers } = require('./scraper');
 const { ensureRole, isManagedRole } = require('./roles');
 const { load, setUser, getUserByHandle } = require('./users');
-const { findBestMatchRaw } = require('./fuzzy');
+const { findBestMatchRaw, similarity } = require('./fuzzy');
 const { updateNickname } = require('./nicknames');
+const { resolveConflicts } = require('./conflicts');
 
 const AUTO_LINK_THRESHOLD = 0.85;
 const REVIEW_THRESHOLD = 0.75;
@@ -81,85 +82,115 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
 }
 
 async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendingDmConfirmations) {
-  const orgNames = freshMembers.map((m) => m.name);
   const autoLinked = [];
   const needsReview = [];
 
-  const allMembers = await guild.members.fetch();
+  console.log('[SYNC] Using cached Discord members:', guild.members.cache.size);
 
-  for (const [discordId, discordMember] of allMembers) {
-    if (discordMember.user.bot) continue;
-    if (verifiedUsers[discordId]) continue;
+  for (const orgMember of freshMembers) {
+    const rsiName = orgMember.name;
 
-    // Check both username and display name; take the highest score
-    const candidates = [...new Set([
-      discordMember.user.username,
-      discordMember.displayName,
-    ].filter(Boolean))];
+    // Skip if this RSI handle is already claimed — handled by processVerifiedUsers + resolveConflicts
+    if (getUserByHandle(rsiName)) continue;
 
-    let bestResult = null;
-    let bestSource = null;
+    // Collect all unverified Discord candidates with any meaningful similarity
+    const candidates = [];
+    guild.members.cache.forEach((member) => {
+      if (member.user.bot) return;
+      if (verifiedUsers[member.id]) return;
 
-    for (const name of candidates) {
-      const result = findBestMatchRaw(name, orgNames);
-      if (result && (!bestResult || result.score > bestResult.score)) {
-        bestResult = result;
-        bestSource = name;
+      const usernameScore = similarity(member.user.username, rsiName);
+      const nicknameScore = similarity(member.nickname || '', rsiName);
+      const bestScore = Math.max(usernameScore, nicknameScore);
+
+      if (bestScore > 0.4) {
+        candidates.push({ discordId: member.id, discordMember: member, usernameScore, nicknameScore, bestScore });
+      }
+    });
+
+    if (candidates.length === 0) continue;
+
+    console.log(
+      `[UNVERIFIED] RSI: ${rsiName} — ${candidates.length} candidate(s): ` +
+      candidates.map((c) => `${c.discordMember.user.tag} (${c.bestScore.toFixed(2)})`).join(', ')
+    );
+
+    let winner = null;
+
+    if (candidates.length === 1) {
+      winner = candidates[0];
+    } else {
+      // Multiple candidates — resolve conflict before any assignment
+
+      // Step 1: One is already verified (edge case guard)
+      const verifiedCandidate = candidates.find((c) => verifiedUsers[c.discordId]);
+      if (verifiedCandidate) {
+        winner = verifiedCandidate;
+        console.log(`[UNVERIFIED] Conflict resolved (verified): ${winner.discordMember.user.tag} wins for RSI: ${rsiName}`);
+      }
+
+      // Step 2: Nickname exactly matches RSI name
+      if (!winner) {
+        const exactNick = candidates.find(
+          (c) => (c.discordMember.nickname || '').toLowerCase() === rsiName.toLowerCase()
+        );
+        if (exactNick) {
+          winner = exactNick;
+          console.log(`[UNVERIFIED] Conflict resolved (exact nickname): ${winner.discordMember.user.tag} wins for RSI: ${rsiName}`);
+        }
+      }
+
+      // Step 3: Earliest joinedAt (only if unambiguous)
+      if (!winner) {
+        const sorted = [...candidates].sort(
+          (a, b) => (a.discordMember.joinedTimestamp || Infinity) - (b.discordMember.joinedTimestamp || Infinity)
+        );
+        if (sorted[0].discordMember.joinedTimestamp !== sorted[1].discordMember.joinedTimestamp) {
+          winner = sorted[0];
+          console.log(`[UNVERIFIED] Conflict resolved (join date): ${winner.discordMember.user.tag} wins for RSI: ${rsiName}`);
+        }
+      }
+
+      // Step 4: No clear winner — flag for manual review
+      if (!winner) {
+        console.log(
+          `[UNVERIFIED] [CONFLICT] Manual review required for RSI: ${rsiName} — ` +
+          candidates.map((c) => c.discordMember.user.tag).join(', ')
+        );
+        continue;
       }
     }
 
-    if (!bestResult) continue;
+    if (!winner) continue;
 
-    const { match, score } = bestResult;
-    const pct = (score * 100).toFixed(1);
+    const pct = (winner.bestScore * 100).toFixed(1);
 
-    if (score >= AUTO_LINK_THRESHOLD) {
-      // Strong match — auto-link, but only if handle isn't already claimed
-      const existingOwner = getUserByHandle(match);
-      if (existingOwner && existingOwner !== discordId) {
-        console.warn(`[sync] Skipping auto-link for ${discordMember.user.tag} — RSI handle "${match}" already claimed by Discord ID ${existingOwner}`);
-        continue;
-      }
-
-      setUser(discordId, match);
-      const orgMember = freshMembers.find((m) => m.name === match);
-      const rolesAdded = await assignRanks(guild, discordMember, orgMember);
+    if (winner.bestScore >= AUTO_LINK_THRESHOLD) {
+      // Strong match — auto-link
+      setUser(winner.discordId, rsiName);
+      const rolesAdded = await assignRanks(guild, winner.discordMember, orgMember);
+      await updateNickname(guild, winner.discordMember, rsiName);
 
       console.log(
-        `[sync] Auto-linked ${discordMember.user.tag} (via "${bestSource}") → RSI: ${match} (${pct}%) — ${rolesAdded} role(s) assigned`
+        `[UNVERIFIED] Auto-linked ${winner.discordMember.user.tag} → RSI: ${rsiName} (${pct}%) — ${rolesAdded} role(s) assigned`
       );
-      autoLinked.push({ discordTag: discordMember.user.tag, rsiHandle: match, score: pct });
+      autoLinked.push({ discordTag: winner.discordMember.user.tag, rsiHandle: rsiName, score: pct });
 
-    } else if (score >= REVIEW_THRESHOLD) {
-      // Medium match — send DM, but only if handle isn't already claimed
-      const existingOwner = getUserByHandle(match);
-      if (existingOwner && existingOwner !== discordId) {
-        console.warn(`[sync] Skipping DM for ${discordMember.user.tag} — RSI handle "${match}" already claimed by Discord ID ${existingOwner}`);
-        continue;
-      }
-
-      const orgMember = freshMembers.find((m) => m.name === match);
-
+    } else if (winner.bestScore >= REVIEW_THRESHOLD) {
+      // Medium match — send DM confirmation
       try {
-        const dmChannel = await discordMember.user.createDM();
+        const dmChannel = await winner.discordMember.user.createDM();
         await dmChannel.send(
           `Hi! We found a possible match between your Discord account and the RSI org **${process.env.ORG_NAME}**.\n\n` +
-          `Is your RSI handle **${match}**?\n\n` +
+          `Is your RSI handle **${rsiName}**?\n\n` +
           `Reply \`yes\` to link your account and receive your roles, or \`no\` to dismiss.`
         );
-
-        // Store pending confirmation so the DM reply can be handled
-        pendingDmConfirmations.set(discordId, { rsiHandle: match, orgMember, guildId: guild.id });
-
-        console.log(
-          `[sync] DM sent to ${discordMember.user.tag} for review — possible RSI match: ${match} (${pct}%)`
-        );
+        pendingDmConfirmations.set(winner.discordId, { rsiHandle: rsiName, orgMember, guildId: guild.id });
+        console.log(`[UNVERIFIED] DM sent to ${winner.discordMember.user.tag} — possible RSI match: ${rsiName} (${pct}%)`);
       } catch (err) {
-        // User may have DMs disabled
-        console.warn(`[sync] Could not DM ${discordMember.user.tag}: ${err.message}`);
+        console.warn(`[UNVERIFIED] Could not DM ${winner.discordMember.user.tag}: ${err.message}`);
       }
-
-      needsReview.push({ discordTag: discordMember.user.tag, rsiHandle: match, score: pct });
+      needsReview.push({ discordTag: winner.discordMember.user.tag, rsiHandle: rsiName, score: pct });
     }
   }
 
@@ -214,6 +245,11 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
   const { updated, rolesAdded, rolesRemoved, unmatched } =
     await processVerifiedUsers(guild, freshMembers, verifiedUsers);
 
+  // Resolve identity conflicts after verified users are processed
+  const latestVerified = load();
+  const { resolved: conflictsResolved, unresolved: conflictsUnresolved } =
+    await resolveConflicts(guild, freshMembers, latestVerified);
+
   // Re-load so any in-flight auto-links are reflected
   const updatedVerified = load();
   const { autoLinked, needsReview } =
@@ -227,12 +263,15 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
     autoLinked,
     needsReview,
     unmatched,
+    conflictsResolved,
+    conflictsUnresolved,
   };
 
   console.log(
     `[sync] Done — users processed: ${updated}, roles assigned: ${rolesAdded}, roles removed: ${rolesRemoved}, ` +
     `new roles created: ${rolesCreated}, auto-linked: ${autoLinked.length}, ` +
-    `DMs sent: ${needsReview.length}, unmatched: ${unmatched.length}`
+    `DMs sent: ${needsReview.length}, unmatched: ${unmatched.length}, ` +
+    `conflicts resolved: ${conflictsResolved}, conflicts pending: ${conflictsUnresolved}`
   );
   console.log('[SYNC] Sync completed successfully');
 

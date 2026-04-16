@@ -37,4 +37,10 @@ function getUserByHandle(rsiHandle) {
   return null;
 }
 
-module.exports = { load, setUser, getUser, getUserByHandle };
+function removeUser(discordId) {
+  const data = load();
+  delete data[discordId];
+  save(data);
+}
+
+module.exports = { load, save, setUser, getUser, getUserByHandle, removeUser };

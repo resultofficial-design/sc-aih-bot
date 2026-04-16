@@ -7,6 +7,7 @@ const { syncRoles, assignRoleToMember } = require('./roles');
 const { findBestMatchRaw } = require('./fuzzy');
 const { runSync, scheduleWeeklySync } = require('./sync');
 const { updateNickname, addOptOut, removeOptOut } = require('./nicknames');
+const { unresolvedConflicts } = require('./conflicts');
 
 const client = new Client({
   intents: [
@@ -180,7 +181,8 @@ client.on(Events.MessageCreate, async (message) => {
         summary.rolesAdded > 0 ||
         summary.rolesRemoved > 0 ||
         summary.rolesCreated > 0 ||
-        summary.autoLinked.length > 0;
+        summary.autoLinked.length > 0 ||
+        summary.conflictsResolved > 0;
 
       const footer = `\n⏱ Completed in **${elapsedSec}s**`;
 
@@ -201,6 +203,12 @@ client.on(Events.MessageCreate, async (message) => {
       }
       if (summary.unmatched.length > 0) {
         lines.push(`⚠️ Unmatched:       **${summary.unmatched.length}** — ${summary.unmatched.map((u) => `\`${u.rsiHandle}\` (${u.reason})`).join(', ')}`);
+      }
+      if (summary.conflictsResolved > 0) {
+        lines.push(`🛡️ Conflicts fixed:  **${summary.conflictsResolved}**`);
+      }
+      if (summary.conflictsUnresolved > 0) {
+        lines.push(`🔍 Needs review:    **${summary.conflictsUnresolved}** — use \`!conflicts\` for details`);
       }
 
       lines.push(footer);
@@ -306,6 +314,26 @@ client.on(Events.MessageCreate, async (message) => {
 
     // No match
     return message.reply(`RSI handle not found. Please check your spelling and try again.`);
+  }
+
+  // !conflicts — show unresolved identity conflicts
+  if (cmd === '!conflicts') {
+    if (unresolvedConflicts.size === 0) {
+      return message.reply('✅ No unresolved identity conflicts.');
+    }
+
+    const lines = ['🔍 **Unresolved identity conflicts** (no clear winner — manual review needed):', ''];
+    for (const [rsiName, candidates] of unresolvedConflicts) {
+      lines.push(`**RSI: ${rsiName}**`);
+      for (const c of candidates) {
+        lines.push(
+          `  • \`${c.discordId}\` ${c.discordTag} — ` +
+          `verified: ${c.signals.verified} | sim: ${c.signals.usernameSim} | ` +
+          `joined: ${c.signals.joinedAt} | role: ${c.signals.hasRole}`
+        );
+      }
+    }
+    return message.reply(lines.join('\n'));
   }
 
   // !nonick — opt out of nickname sync
