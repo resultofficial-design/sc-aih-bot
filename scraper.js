@@ -140,8 +140,10 @@ async function extractMembers(page, orgName) {
     console.log(`[scraper] Extracted members after retry: ${members.length}`);
   }
 
-  if (members.length === 0) {
-    throw new Error('No members extracted after retry. The page layout may have changed.');
+  console.log('[SYNC DEBUG] Members length:', members.length);
+
+  if (!members || members.length === 0) {
+    throw new Error('No members found after extraction');
   }
 
   return members;
@@ -167,7 +169,10 @@ async function scrapeOrgMembers(orgName) {
       await login(page);
       const members = await extractMembers(page, orgName);
       console.log(`[scraper] Found ${members.length} members.`);
-      return members;
+      if (members && members.length > 0) {
+        return members;
+      }
+      throw new Error(`extractMembers returned empty on attempt ${attempt}`);
     } catch (err) {
       lastError = err;
       console.error(`[scraper] Attempt ${attempt} failed: ${err.message}`);

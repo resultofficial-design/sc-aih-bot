@@ -1,16 +1,12 @@
 const cron = require('node-cron');
 const { scrapeOrgMembers } = require('./scraper');
-const { ensureRole } = require('./roles');
+const { ensureRole, isManagedRole } = require('./roles');
 const { load, setUser } = require('./users');
 const { findBestMatchRaw } = require('./fuzzy');
 const { updateNickname } = require('./nicknames');
 
 const AUTO_LINK_THRESHOLD = 0.85;
 const REVIEW_THRESHOLD = 0.75;
-
-const RSI_RANK_NAMES = new Set([
-  'Officer', 'Member', 'Affiliate', 'Recruitment', 'Branding',
-]);
 
 async function assignRanks(guild, discordMember, orgMember) {
   const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
@@ -67,7 +63,8 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
     }
 
     for (const role of discordMember.roles.cache.values()) {
-      if (RSI_RANK_NAMES.has(role.name) && !expectedRanks.has(role.name)) {
+      if (isManagedRole(role.id) && !expectedRanks.has(role.name)) {
+        console.log(`[sync] Attempting to remove managed role "${role.name}" from ${discordMember.user.tag}`);
         await discordMember.roles.remove(role);
         console.log(`[sync] Removed role "${role.name}" from ${discordMember.user.tag}`);
         rolesRemoved++;
@@ -160,9 +157,6 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
 async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
   console.log('[sync] Starting sync...');
 
-  // TEMPORARY: delay to test progress message
-  await new Promise(resolve => setTimeout(resolve, 7000));
-
   let freshMembers;
   try {
     freshMembers = await scrapeOrgMembers(process.env.ORG_NAME);
@@ -180,7 +174,6 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
   for (const m of freshMembers) {
     for (const rank of m.rank.split(',').map((r) => r.trim()).filter(Boolean)) {
       orgRankNames.add(rank);
-      RSI_RANK_NAMES.add(rank);
     }
   }
 

@@ -1,3 +1,5 @@
+const fs = require('fs');
+
 const ROLE_COLORS = {
   Officer: 0x3498db,
   Affiliate: 0x95a5a6,
@@ -7,6 +9,28 @@ const ROLE_COLORS = {
 };
 
 const DEFAULT_COLOR = 0x99aab5;
+const MANAGED_ROLES_FILE = './roles.json';
+
+// Load persisted set of bot-managed role IDs
+function loadManagedRoles() {
+  try {
+    const data = JSON.parse(fs.readFileSync(MANAGED_ROLES_FILE, 'utf8'));
+    return new Set(Array.isArray(data.roles) ? data.roles : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveManagedRoles(set) {
+  fs.writeFileSync(MANAGED_ROLES_FILE, JSON.stringify({ roles: [...set] }, null, 2));
+}
+
+const managedRoleIds = loadManagedRoles();
+console.log(`[roles] Loaded ${managedRoleIds.size} managed role ID(s) from roles.json`);
+
+function isManagedRole(roleId) {
+  return managedRoleIds.has(roleId);
+}
 
 async function ensureRole(guild, roleName) {
   const existing = guild.roles.cache.find(
@@ -20,7 +44,10 @@ async function ensureRole(guild, roleName) {
     reason: 'Auto-created by RSI role sync',
   });
 
-  console.log(`[roles] Created role: ${roleName}`);
+  // Track this role as bot-managed
+  managedRoleIds.add(role.id);
+  saveManagedRoles(managedRoleIds);
+  console.log(`[roles] Created role: ${roleName} (ID: ${role.id})`);
   return role;
 }
 
@@ -53,4 +80,4 @@ async function assignRoleToMember(guild, discordMember, roleName) {
   }
 }
 
-module.exports = { syncRoles, ensureRole, assignRoleToMember };
+module.exports = { syncRoles, ensureRole, assignRoleToMember, isManagedRole };

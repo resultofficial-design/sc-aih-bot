@@ -3,7 +3,7 @@ const config = require('./config');
 const { scrapeOrgMembers } = require('./scraper');
 const { load, setUser, getUser } = require('./users');
 const { syncRoles, assignRoleToMember } = require('./roles');
-const { findBestMatch } = require('./fuzzy');
+const { findBestMatchRaw } = require('./fuzzy');
 const { runSync, scheduleWeeklySync } = require('./sync');
 const { updateNickname, addOptOut, removeOptOut } = require('./nicknames');
 
@@ -256,9 +256,18 @@ client.on(Events.MessageCreate, async (message) => {
 
     // Fuzzy match
     const names = membersRef.members.map((m) => m.name);
-    const fuzzy = findBestMatch(rsiHandle, names);
+    const fuzzy = findBestMatchRaw(rsiHandle, names);
 
-    if (fuzzy) {
+    console.log(`[VERIFY] Best match: ${fuzzy?.match} Score: ${fuzzy?.score?.toFixed(3)}`);
+
+    if (fuzzy && fuzzy.score >= 0.85) {
+      // High confidence — auto-accept
+      const orgMember = membersRef.members.find((m) => m.name === fuzzy.match);
+      return completeVerification(message, fuzzy.match, orgMember);
+    }
+
+    if (fuzzy && fuzzy.score >= 0.7) {
+      // Medium confidence — ask for confirmation
       const orgMember = membersRef.members.find((m) => m.name === fuzzy.match);
       pendingConfirmations.set(message.author.id, { suggestedName: fuzzy.match, orgMember });
       return message.reply(
@@ -266,8 +275,8 @@ client.on(Events.MessageCreate, async (message) => {
       );
     }
 
-    // No match — save handle without role
-    return completeVerification(message, rsiHandle, null);
+    // No match
+    return message.reply(`RSI handle not found. Please check your spelling and try again.`);
   }
 
   // !nonick — opt out of nickname sync
