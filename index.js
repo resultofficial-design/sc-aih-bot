@@ -1,24 +1,29 @@
-const { Client, GatewayIntentBits, Events } = require('discord.js');
+const { Client, GatewayIntentBits, Events, ChannelType } = require('discord.js');
 const config = require('./config');
 const { scrapeOrgMembers } = require('./scraper');
 const { load, setUser, getUser } = require('./users');
 const { syncRoles, assignRoleToMember } = require('./roles');
 const { findBestMatch } = require('./fuzzy');
 const { runSync, scheduleWeeklySync } = require('./sync');
+const { updateNickname, addOptOut, removeOptOut } = require('./nicknames');
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
 });
 
 // Shared reference so sync.js can update the cache
 const membersRef = { members: [] };
 
-// Pending fuzzy confirmations: discordId → { suggestedName, orgMember }
+// Pending channel confirmations (!verify fuzzy): discordId → { suggestedName, orgMember }
 const pendingConfirmations = new Map();
+
+// Pending DM confirmations (auto-match from sync): discordId → { rsiHandle, orgMember, guildId }
+const pendingDmConfirmations = new Map();
 
 async function completeVerification(message, rsiHandle, orgMember) {
   setUser(message.author.id, rsiHandle);
@@ -31,6 +36,8 @@ async function completeVerification(message, rsiHandle, orgMember) {
       for (const rank of ranks) {
         await assignRoleToMember(message.guild, discordMember, rank);
       }
+
+      await updateNickname(message.guild, discordMember, rsiHandle);
 
       return message.reply(
         `Verified! RSI handle \`${rsiHandle}\` linked and role(s) **${ranks.join(', ')}** assigned.`
@@ -58,7 +65,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     await guild.roles.fetch();
     await syncRoles(guild, membersRef.members);
 
-    scheduleWeeklySync(guild, membersRef);
+    scheduleWeeklySync(guild, membersRef, pendingDmConfirmations);
   } catch (err) {
     console.error('[startup] Failed:', err.message);
   }
@@ -67,53 +74,148 @@ client.once(Events.ClientReady, async (readyClient) => {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
+  console.log('Message received:', message.content);
+
   const content = message.content.trim();
+  const cmd = content.toLowerCase();
+  const isDM = message.channel.type === ChannelType.DM;
+
+  // --- DM reply handler (auto-match confirmation from sync) ---
+  if (isDM && pendingDmConfirmations.has(message.author.id)) {
+    const answer = content.toLowerCase();
+    const { rsiHandle, orgMember, guildId } = pendingDmConfirmations.get(message.author.id);
+
+    if (answer === 'yes' || answer === 'y') {
+      pendingDmConfirmations.delete(message.author.id);
+      setUser(message.author.id, rsiHandle);
+
+      // Assign roles in the guild
+      try {
+        const guild = await client.guilds.fetch(guildId);
+        const discordMember = await guild.members.fetch(message.author.id);
+        const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
+
+        for (const rank of ranks) {
+          await assignRoleToMember(guild, discordMember, rank);
+        }
+
+        console.log(`[dm-confirm] Confirmed: ${message.author.tag} → RSI: ${rsiHandle}`);
+        return message.reply(
+          `Verified! RSI handle \`${rsiHandle}\` linked and role(s) **${ranks.join(', ')}** assigned in the server.`
+        );
+      } catch (err) {
+        console.error('[dm-confirm] Role assignment failed:', err.message);
+        return message.reply(`Linked as \`${rsiHandle}\`, but role assignment failed. Please contact an admin.`);
+      }
+    }
+
+    if (answer === 'no' || answer === 'n') {
+      pendingDmConfirmations.delete(message.author.id);
+      console.log(`[dm-confirm] Rejected by ${message.author.tag} for RSI: ${rsiHandle}`);
+      return message.reply('No problem! Use `!verify <RSI_HANDLE>` in the server if you want to link your account manually.');
+    }
+
+    // Unrecognised reply — re-prompt
+    return message.reply('Please reply with `yes` or `no`.');
+  }
+
+  // Ignore DMs that aren't pending confirmations
+  if (isDM) return;
+
+  // --- Guild commands ---
 
   // !ping
-  if (content === '!ping') {
+  if (cmd === '!ping') {
     return message.reply('pong');
   }
 
   // !sync — manual sync trigger
-  if (content === '!sync') {
-    if (!message.guild) return message.reply('This command must be used in a server.');
+  if (cmd.startsWith('!sync')) {
+    console.log('Sync command detected');
 
-    await message.reply('Syncing org members and roles, please wait...');
+    let startMessage = await message.reply('Sync started...');
+    let progressMessage = null;
+    let syncDone = false;
 
-    try {
-      const summary = await runSync(message.guild, membersRef);
+    // Send a "Still running..." message after 5 seconds if sync isn't done yet
+    const progressTimer = setTimeout(async () => {
+      if (!syncDone) {
+        try {
+          progressMessage = await message.channel.send('Still running...');
+        } catch {
+          // Channel may be unavailable — ignore
+        }
+      }
+    }, 5000);
 
-      if (summary.error) {
-        return message.reply(`Sync failed: ${summary.error}`);
+    const safeDelete = async (msg) => {
+      if (!msg) return;
+      try { await msg.delete(); } catch { /* already deleted or no permission */ }
+    };
+
+    const buildSummary = (summary) => {
+      const hasChanges =
+        summary.usersUpdated > 0 ||
+        summary.rolesAdded > 0 ||
+        summary.rolesRemoved > 0 ||
+        summary.rolesCreated > 0 ||
+        summary.autoLinked.length > 0;
+
+      if (!hasChanges) return 'Sync complete. No changes were needed.';
+
+      const lines = [
+        'Sync complete:',
+        `- **${summary.usersUpdated}** users processed`,
+        `- **${summary.rolesAdded}** roles assigned`,
+        `- **${summary.rolesRemoved}** roles removed`,
+        `- **${summary.rolesCreated}** new roles created`,
+        `- **${summary.autoLinked.length}** users auto-linked`,
+      ];
+
+      if (summary.needsReview.length > 0) {
+        lines.push(`- **${summary.needsReview.length}** DMs sent for confirmation`);
+      }
+      if (summary.unmatched.length > 0) {
+        lines.push(`- **${summary.unmatched.length}** unmatched: ${summary.unmatched.map((u) => `\`${u.rsiHandle}\` (${u.reason})`).join(', ')}`);
       }
 
-      const unmatchedList = summary.unmatched.length
-        ? `\n**Unmatched:** ${summary.unmatched.map((u) => `\`${u.rsiHandle}\` (${u.reason})`).join(', ')}`
-        : '';
+      return lines.join('\n');
+    };
 
-      const reviewList = summary.needsReview.length
-        ? `\n**Needs review:** ${summary.needsReview.map((u) => `\`${u.discordTag}\` → \`${u.rsiHandle}\` (${u.score}%)`).join(', ')}`
-        : '';
+    try {
+      console.log('Running sync function...');
+      const summary = await runSync(message.guild, membersRef, pendingDmConfirmations);
 
-      return message.reply(
-        `Sync complete!\n` +
-        `**Users updated:** ${summary.usersUpdated}\n` +
-        `**Roles added:** ${summary.rolesAdded}\n` +
-        `**Roles removed:** ${summary.rolesRemoved}\n` +
-        `**Auto-linked:** ${summary.autoLinked.length}\n` +
-        `**Needs review:** ${summary.needsReview.length}` +
-        unmatchedList +
-        reviewList
-      );
+      syncDone = true;
+      clearTimeout(progressTimer);
+
+      await safeDelete(startMessage);
+      await safeDelete(progressMessage);
+
+      if (summary.error) {
+        console.error(`[sync] Failed: ${summary.error}`);
+        return message.channel.send(`Sync failed: ${summary.error}`);
+      }
+
+      const reply = buildSummary(summary);
+      console.log(`[sync] ${reply.replace(/\*\*/g, '')}`);
+      return message.channel.send(reply);
+
     } catch (err) {
-      console.error('[sync] Unexpected error:', err.message);
-      return message.reply('Sync failed due to an unexpected error. Check the logs.');
+      syncDone = true;
+      clearTimeout(progressTimer);
+
+      await safeDelete(startMessage);
+      await safeDelete(progressMessage);
+
+      console.error('Sync error:', err);
+      return message.channel.send(`Sync failed: ${err.message}`);
     }
   }
 
-  // Handle pending fuzzy confirmation (yes/no)
+  // Handle pending fuzzy confirmation from !verify (yes/no in guild channel)
   if (pendingConfirmations.has(message.author.id)) {
-    const answer = content.toLowerCase();
+    const answer = cmd;
 
     if (answer === 'yes' || answer === 'y') {
       const { suggestedName, orgMember } = pendingConfirmations.get(message.author.id);
@@ -128,7 +230,7 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   // !verify <RSI_HANDLE>
-  if (content.startsWith('!verify ')) {
+  if (cmd.startsWith('!verify ')) {
     const rsiHandle = content.slice('!verify '.length).trim();
 
     if (!rsiHandle) {
@@ -156,12 +258,24 @@ client.on(Events.MessageCreate, async (message) => {
       );
     }
 
-    // No match — still save the handle without role
+    // No match — save handle without role
     return completeVerification(message, rsiHandle, null);
   }
 
+  // !nonick — opt out of nickname sync
+  if (cmd === '!nonick') {
+    addOptOut(message.author.id);
+    return message.reply('You have opted out of automatic nickname updates. Use `!yesnick` to re-enable.');
+  }
+
+  // !yesnick — opt back in
+  if (cmd === '!yesnick') {
+    removeOptOut(message.author.id);
+    return message.reply('You have opted back in to automatic nickname updates.');
+  }
+
   // !whoami
-  if (content === '!whoami') {
+  if (cmd === '!whoami') {
     const rsiHandle = getUser(message.author.id);
 
     if (!rsiHandle) {

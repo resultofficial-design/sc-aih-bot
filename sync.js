@@ -3,12 +3,11 @@ const { scrapeOrgMembers } = require('./scraper');
 const { ensureRole } = require('./roles');
 const { load, setUser } = require('./users');
 const { findBestMatchRaw } = require('./fuzzy');
+const { updateNickname } = require('./nicknames');
 
-// Thresholds for unverified member auto-linking
 const AUTO_LINK_THRESHOLD = 0.85;
-const REVIEW_THRESHOLD = 0.70;
+const REVIEW_THRESHOLD = 0.75;
 
-// All known RSI rank names (used to identify which Discord roles are RSI-managed)
 const RSI_RANK_NAMES = new Set([
   'Officer', 'Member', 'Affiliate', 'Recruitment', 'Branding',
 ]);
@@ -75,32 +74,31 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
       }
     }
 
+    // Update nickname to RSI handle
+    await updateNickname(guild, discordMember, orgMember.name);
+
     updated++;
   }
 
   return { updated, rolesAdded, rolesRemoved, unmatched };
 }
 
-async function processUnverifiedUsers(guild, freshMembers, verifiedUsers) {
+async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendingDmConfirmations) {
   const orgNames = freshMembers.map((m) => m.name);
   const autoLinked = [];
   const needsReview = [];
 
-  // Fetch all guild members (paginated automatically by discord.js)
   const allMembers = await guild.members.fetch();
 
   for (const [discordId, discordMember] of allMembers) {
-    // Skip bots
     if (discordMember.user.bot) continue;
-
-    // Skip already verified
     if (verifiedUsers[discordId]) continue;
 
-    // Candidates to match against: username and nickname
-    const candidates = [
+    // Check both username and display name; take the highest score
+    const candidates = [...new Set([
       discordMember.user.username,
       discordMember.displayName,
-    ].filter(Boolean);
+    ].filter(Boolean))];
 
     let bestResult = null;
     let bestSource = null;
@@ -119,20 +117,39 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers) {
     const pct = (score * 100).toFixed(1);
 
     if (score >= AUTO_LINK_THRESHOLD) {
-      // Auto-link
+      // Strong match — auto-link immediately
       setUser(discordId, match);
       const orgMember = freshMembers.find((m) => m.name === match);
       const rolesAdded = await assignRanks(guild, discordMember, orgMember);
 
       console.log(
-        `[sync] Auto-linked unverified user ${discordMember.user.tag} (via "${bestSource}") → RSI: ${match} (${pct}%) — ${rolesAdded} role(s) assigned`
+        `[sync] Auto-linked ${discordMember.user.tag} (via "${bestSource}") → RSI: ${match} (${pct}%) — ${rolesAdded} role(s) assigned`
       );
       autoLinked.push({ discordTag: discordMember.user.tag, rsiHandle: match, score: pct });
+
     } else if (score >= REVIEW_THRESHOLD) {
-      // Log for review — not auto-linked
-      console.log(
-        `[sync] Review needed: ${discordMember.user.tag} (via "${bestSource}") might be RSI: ${match} (${pct}%)`
-      );
+      // Medium match — send DM asking for confirmation
+      const orgMember = freshMembers.find((m) => m.name === match);
+
+      try {
+        const dmChannel = await discordMember.user.createDM();
+        await dmChannel.send(
+          `Hi! We found a possible match between your Discord account and the RSI org **${process.env.ORG_NAME}**.\n\n` +
+          `Is your RSI handle **${match}**?\n\n` +
+          `Reply \`yes\` to link your account and receive your roles, or \`no\` to dismiss.`
+        );
+
+        // Store pending confirmation so the DM reply can be handled
+        pendingDmConfirmations.set(discordId, { rsiHandle: match, orgMember, guildId: guild.id });
+
+        console.log(
+          `[sync] DM sent to ${discordMember.user.tag} for review — possible RSI match: ${match} (${pct}%)`
+        );
+      } catch (err) {
+        // User may have DMs disabled
+        console.warn(`[sync] Could not DM ${discordMember.user.tag}: ${err.message}`);
+      }
+
       needsReview.push({ discordTag: discordMember.user.tag, rsiHandle: match, score: pct });
     }
   }
@@ -140,10 +157,9 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers) {
   return { autoLinked, needsReview };
 }
 
-async function runSync(guild, cachedMembersRef) {
+async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
   console.log('[sync] Starting sync...');
 
-  // Fetch fresh org members
   let freshMembers;
   try {
     freshMembers = await scrapeOrgMembers(process.env.ORG_NAME);
@@ -155,7 +171,7 @@ async function runSync(guild, cachedMembersRef) {
 
   cachedMembersRef.members = freshMembers;
 
-  // Ensure all org ranks exist as Discord roles
+  // Ensure all org ranks exist as Discord roles, count newly created ones
   await guild.roles.fetch();
   const orgRankNames = new Set();
   for (const m of freshMembers) {
@@ -164,43 +180,47 @@ async function runSync(guild, cachedMembersRef) {
       RSI_RANK_NAMES.add(rank);
     }
   }
+
+  let rolesCreated = 0;
   for (const rank of orgRankNames) {
+    const exists = guild.roles.cache.find((r) => r.name.toLowerCase() === rank.toLowerCase());
     await ensureRole(guild, rank);
+    if (!exists) rolesCreated++;
   }
 
-  // Load current verified users (do NOT mutate this object — setUser handles persistence)
   const verifiedUsers = load();
 
-  // Process verified users
   const { updated, rolesAdded, rolesRemoved, unmatched } =
     await processVerifiedUsers(guild, freshMembers, verifiedUsers);
 
-  // Process unverified users (re-load so auto-links from above are reflected)
+  // Re-load so any in-flight auto-links are reflected
   const updatedVerified = load();
   const { autoLinked, needsReview } =
-    await processUnverifiedUsers(guild, freshMembers, updatedVerified);
+    await processUnverifiedUsers(guild, freshMembers, updatedVerified, pendingDmConfirmations);
 
   const summary = {
     usersUpdated: updated,
     rolesAdded,
     rolesRemoved,
-    unmatched,
+    rolesCreated,
     autoLinked,
     needsReview,
+    unmatched,
   };
 
   console.log(
-    `[sync] Done. Verified updated: ${updated}, roles added: ${rolesAdded}, roles removed: ${rolesRemoved}, ` +
-    `unmatched: ${unmatched.length}, auto-linked: ${autoLinked.length}, needs review: ${needsReview.length}`
+    `[sync] Done — users processed: ${updated}, roles assigned: ${rolesAdded}, roles removed: ${rolesRemoved}, ` +
+    `new roles created: ${rolesCreated}, auto-linked: ${autoLinked.length}, ` +
+    `DMs sent: ${needsReview.length}, unmatched: ${unmatched.length}`
   );
 
   return summary;
 }
 
-function scheduleWeeklySync(guild, cachedMembersRef) {
+function scheduleWeeklySync(guild, cachedMembersRef, pendingDmConfirmations) {
   cron.schedule('0 0 * * 0', async () => {
     console.log('[sync] Weekly sync triggered.');
-    await runSync(guild, cachedMembersRef);
+    await runSync(guild, cachedMembersRef, pendingDmConfirmations);
   });
 
   console.log('[sync] Weekly sync scheduled (Sundays at midnight).');
