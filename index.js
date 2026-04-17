@@ -44,6 +44,9 @@ const pendingOnboarding = new Map();
 // Prevent concurrent !sync runs
 let isSyncing = false;
 
+// Nickname violation attempt tracker: discordId → count (resets on restart)
+const nickViolations = new Map();
+
 // --- Helper: find an admin/log channel in a guild ---
 function findAdminChannel(guild) {
   const names = ['admin-log', 'bot-log', 'admin-logs', 'bot-logs', 'admin', 'bot-commands'];
@@ -324,6 +327,73 @@ client.on(Events.GuildMemberAdd, async (member) => {
   // No strong auto-match — start interactive onboarding
   console.log(`[JOIN FLOW] No auto-match for ${member.user.tag} (best score: ${bestScore.toFixed(2)}) — starting onboarding`);
   await startOnboarding(member);
+});
+
+// ─── GuildMemberUpdate (nickname enforcement) ────────────────────────────────
+
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  const oldName = oldMember.displayName;
+  const newName = newMember.displayName;
+
+  // Only care about nickname changes
+  if (oldName === newName) return;
+
+  console.log('[NICK CHANGE DETECTED]', {
+    user: newMember.user.username,
+    oldName,
+    newName,
+  });
+
+  // Only enforce for verified users
+  const correctHandle = getUser(newMember.id);
+  if (!correctHandle) return;
+
+  // Nickname already matches — nothing to do
+  if (newName === correctHandle) return;
+
+  // ── Revert nickname ────────────────────────────────────────────────────────
+  try {
+    await newMember.setNickname(correctHandle, 'Nickname enforcement — must match RSI handle');
+    console.log(`[NICKNAME VIOLATION] Reverted ${newMember.user.username}: "${newName}" → "${correctHandle}"`);
+  } catch (err) {
+    console.warn(`[NICKNAME VIOLATION] Could not revert ${newMember.user.username}: ${err.message}`);
+  }
+
+  // ── Track violation attempts ───────────────────────────────────────────────
+  const attempts = (nickViolations.get(newMember.id) || 0) + 1;
+  nickViolations.set(newMember.id, attempts);
+
+  console.log('[NICKNAME VIOLATION]', { user: newMember.user.username, attempts });
+
+  // ── Warn user via DM ───────────────────────────────────────────────────────
+  try {
+    const dm = await newMember.user.createDM();
+    await dm.send(
+      `⚠️ You are not allowed to change your nickname.\n` +
+      `It must match your RSI handle: **${correctHandle}**.\n\n` +
+      `Repeated attempts may result in penalties.`
+    );
+  } catch (e) { /* DMs may be closed */ }
+
+  // ── Escalate after 3 violations ───────────────────────────────────────────
+  if (attempts >= 3) {
+    console.warn(`[NICKNAME ABUSE] ${newMember.user.tag} has violated nickname enforcement ${attempts} times`);
+
+    const adminCh = findAdminChannel(newMember.guild);
+    if (adminCh) {
+      try {
+        await adminCh.send(
+          `🚨 **Nickname abuse detected**\n` +
+          `User: ${newMember} (${newMember.user.tag})\n` +
+          `RSI handle: **${correctHandle}**\n` +
+          `Violations: **${attempts}**\n` +
+          `Last attempted nickname: \`${newName}\``
+        );
+      } catch (e) {
+        console.warn('[NICKNAME ABUSE] Could not send admin alert:', e.message);
+      }
+    }
+  }
 });
 
 // ─── InteractionCreate (button presses) ─────────────────────────────────────
