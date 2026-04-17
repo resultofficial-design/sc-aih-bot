@@ -82,149 +82,92 @@ async function scrapeProfile(browser, url) {
 async function extractMembers(page, orgName, browser) {
   const membersUrl = `${RSI_HOME_URL}/orgs/${orgName}/members`;
 
-  // ── Step 1: Intercept API responses before navigating ──────────────────────
-  // Playwright fires 'response' for every network response — no setup needed.
-  // We listen broadly and filter down to JSON payloads that look like member data.
-  let membersData = [];
-
-  page.on('response', async (response) => {
-    const url = response.url();
-
-    // Target RSI's known member/organization API endpoints
-    const relevant = url.includes('/members') || url.includes('/organization');
-    if (!relevant) return;
-
-    // Ignore non-JSON responses
-    const ct = response.headers()['content-type'] || '';
-    if (!ct.includes('application/json')) return;
-    if (!response.ok()) return;
-
-    let data;
-    try {
-      data = await response.json();
-    } catch {
-      return; // body already consumed or not valid JSON
-    }
-
-    try {
-      console.log('[API RESPONSE]', url, '→ top-level keys:', Object.keys(data || {}).join(', '));
-
-      // Try every common RSI API response envelope shape
-      const candidates = [
-        data?.data,
-        data?.members,
-        data?.result,
-        data?.hits,
-        Array.isArray(data) ? data : null,
-      ].filter(Array.isArray);
-
-      for (const arr of candidates) {
-        if (arr.length === 0) continue;
-        const first = arr[0];
-        // Must look like a member object
-        if (!first.handle && !first.nickname && !first.name) continue;
-
-        const extracted = arr
-          .map((m) => ({
-            handle: (m.handle || m.nickname || m.name || '').trim(),
-            displayName: (m.displayName || m.display_name || m.name || m.handle || '').trim(),
-            role: (m.rank || m.role || 'Member').trim(),
-          }))
-          .filter((m) => m.handle.length >= 2);
-
-        if (extracted.length > membersData.length) {
-          membersData = extracted;
-          console.log('[API MEMBERS FOUND]', membersData.length, 'members from', url);
-        }
-      }
-    } catch {
-      // skip silently
-    }
-  });
-
-  // ── Step 2: Navigate and let the page trigger its own API calls ────────────
-  console.log('[SCRAPER] Loading org page — waiting for API responses...');
+  // Navigate first so the page session/cookies are active for fetch calls
+  console.log('[SCRAPER] Loading org page...');
   await page.goto(membersUrl, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
-  await page.waitForTimeout(2000);
 
-  // Scroll to trigger any lazy-loaded API calls
-  await page.evaluate(async () => {
-    await new Promise((resolve) => {
-      const timer = setInterval(() => {
-        window.scrollBy(0, 400);
-        if (window.scrollY + window.innerHeight >= document.body.scrollHeight) {
-          clearInterval(timer); resolve();
+  // ── Fetch all member pages directly via RSI's internal API ────────────────
+  console.log('[SCRAPER] Fetching members via API...');
+  const result = await page.evaluate(async (symbol) => {
+    const allMembers = [];
+    let pageNum = 1;
+    let total = 0;
+
+    while (true) {
+      const res = await fetch('/api/orgs/getOrgMembers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol, search: '', pagesize: 32, page: pageNum }),
+      });
+      const data = await res.json();
+      if (!data?.data) break;
+
+      const html = data.data.html;
+      total = data.data.totalrows || total;
+      if (!html || html.length === 0) break;
+
+      // Parse HTML into member objects inside browser context
+      const ROLE_NAMES = [
+        'affiliate', 'member', 'officer', 'founder', 'recruit', 'leader',
+        'admiral', 'commander', 'captain', 'veteran', 'staff', 'admin',
+        'director', 'chief', 'head', 'deputy', 'corporal', 'sergeant',
+      ];
+      const container = document.createElement('div');
+      container.innerHTML = html;
+      container.querySelectorAll('[class*="member"]').forEach((card) => {
+        const lines = card.innerText.split('\n').map(t => t.trim()).filter(Boolean);
+        // Debug: log card structure so we can see what lines[0/1/2+] contain
+        if (allMembers.length < 3) {
+          lines.forEach((line, i) => console.log(`[${i}]`, line));
         }
-      }, 200);
-    });
-  });
-  await page.waitForTimeout(2000);
+        if (lines.length >= 2) {
+          const displayName = lines[0];
+          const handle = lines[1];
+          const role = lines[2] || 'Member';
+          const isRole = ROLE_NAMES.includes(handle.toLowerCase());
+          if (!isRole && handle.length > 2) {
+            allMembers.push({ displayName, handle, role });
+          }
+        }
+      });
 
-  // ── Step 3: Wait up to 15s for API data ───────────────────────────────────
-  const deadline = Date.now() + 15000;
-  while (membersData.length === 0 && Date.now() < deadline) {
-    await page.waitForTimeout(500);
-  }
-
-  if (membersData.length > 0) {
-    const results = membersData.map((m) => ({
-      name: m.handle,
-      displayName: m.displayName || m.handle,
-      handle: m.handle,
-      role: m.role,
-      rank: m.role,  // rank alias for backwards compat
-    }));
-    console.log('[FINAL MEMBERS COUNT]', results.length);
-    console.log('[SAMPLE]', results.slice(0, 5));
-    console.log('[SCRAPER] Members found:', results.map((m) => m.handle));
-    console.log('[SYNC] Proceeding with sync using', results.length, 'members');
-    return results;
-  }
-
-  // ── Step 4: Fallback — parallel profile page scraping ─────────────────────
-  console.warn('[SCRAPER] No API data captured — falling back to profile page scraping');
-
-  const rawLinks = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('a[href*="/citizens/"]')).map((a) => a.href)
-  );
-  const uniqueLinks = [...new Set(rawLinks)];
-  console.log('[PROFILE LINKS FOUND]', uniqueLinks.length);
-
-  if (uniqueLinks.length === 0) {
-    throw new Error('Scraper failed: no API data and no /citizens/ profile links found');
-  }
-
-  const results = [];
-  const totalBatches = Math.ceil(uniqueLinks.length / CONCURRENCY);
-
-  for (let i = 0; i < uniqueLinks.length; i += CONCURRENCY) {
-    const batch = uniqueLinks.slice(i, i + CONCURRENCY);
-    const batchNum = Math.floor(i / CONCURRENCY) + 1;
-    console.log(`[BATCH ${batchNum}/${totalBatches}] profiles ${i + 1}–${Math.min(i + CONCURRENCY, uniqueLinks.length)} of ${uniqueLinks.length}`);
-
-    const batchResults = await Promise.all(batch.map((url) => scrapeProfile(browser, url)));
-
-    for (const r of batchResults) {
-      if (r?.handle?.length >= 2) {
-        results.push({
-          name: r.handle, displayName: r.handle, handle: r.handle,
-          role: 'Member', rank: 'Member', profileUrl: r.url,
-        });
-      }
+      console.log('[PAGE LOADED]', pageNum, '— members so far:', allMembers.length);
+      pageNum++;
+      // stop if we've likely reached all pages
+      if (allMembers.length >= total) break;
     }
-    console.log('[PROGRESS]', results.length, '/', uniqueLinks.length);
+
+    // Deduplicate by handle
+    const unique = new Map();
+    allMembers.forEach(m => unique.set(m.handle.toLowerCase(), m));
+    const finalMembers = Array.from(unique.values());
+
+    if (finalMembers.length !== total) {
+      console.warn('[MISMATCH]', finalMembers.length, 'parsed vs', total, 'expected');
+    }
+    console.log('[FINAL CLEAN MEMBERS]', finalMembers.length);
+
+    return { total, members: finalMembers };
+  }, orgName.toUpperCase());
+
+  console.log('[TOTAL MEMBERS]', result.total);
+  console.log('[PARSED MEMBERS]', result.members.length);
+
+  if (result.members.length === 0) {
+    throw new Error('API returned 0 members — check session or org symbol');
   }
 
-  console.log('[FINAL COUNT]', results.length);
-  console.log('[SAMPLE]', results.slice(0, 5));
+  const members = result.members.map((m) => ({
+    name: m.handle,
+    displayName: m.displayName || m.handle,
+    handle: m.handle,
+    role: 'Member',
+    rank: 'Member',
+  }));
 
-  if (results.length === 0) {
-    throw new Error('Scraper failed: both API interception and profile scraping returned 0 members');
-  }
-
-  console.log('[SCRAPER] Members found:', results.map((m) => m.handle));
-  console.log('[SYNC] Proceeding with sync using', results.length, 'members');
-  return results;
+  console.log('[SCRAPER] Members found:', members.map((m) => m.handle));
+  console.log('[SYNC] Proceeding with sync using', members.length, 'members');
+  return members;
 }
 
 async function scrapeOrgMembers(orgName) {
