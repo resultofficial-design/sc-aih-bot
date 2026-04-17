@@ -166,8 +166,8 @@ async function extractMembers(page, orgName, browser) {
     name: m.handle,
     displayName: m.displayName || m.handle,
     handle: m.handle,
-    role: 'Member',
-    rank: 'Member',
+    role: m.role || 'Member',
+    rank: m.role || 'Member',
   }));
 
   console.log('[SCRAPER] Members found:', members.map((m) => m.handle));

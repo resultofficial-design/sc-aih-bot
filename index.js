@@ -62,6 +62,21 @@ function findAdminChannel(guild) {
 // --- Helper: clean string for similarity comparison ---
 const clean = (str) => (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
+// --- Helper: DM all configured mods ---
+async function notifyMods(text) {
+  const MOD_HANDLES = (process.env.MOD_RSI_HANDLES || '').split(',').map(h => h.trim()).filter(Boolean);
+  for (const modHandle of MOD_HANDLES) {
+    const modDiscordId = getUserByHandle(modHandle);
+    if (!modDiscordId) continue;
+    try {
+      const modUser = await client.users.fetch(modDiscordId);
+      await modUser.send(text);
+    } catch (e) {
+      console.warn(`[MOD NOTIFY] Could not DM mod ${modHandle}: ${e.message}`);
+    }
+  }
+}
+
 // --- Start onboarding DM flow for a new guild member ---
 async function startOnboarding(member) {
   if (isBlocked(member.id)) {
@@ -102,11 +117,27 @@ async function handleOnboardingInput(message, handle) {
   );
 
   if (!orgMember) {
-    console.log(`[HANDLE INVALID] "${handle}" not found in org`);
-    return message.reply(
-      `❌ Handle \`${handle}\` was not found in the org roster.\n` +
-      `Please check your spelling and try again. Use your RSI handle (not your display name).`
+    console.log(`[HANDLE NOT IN ORG] "${handle}" — offering non-org verification`);
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`nonorg_yes_${handle}`)
+        .setLabel('✅ Yes, continue')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`nonorg_no`)
+        .setLabel('❌ No, retry')
+        .setStyle(ButtonStyle.Danger)
     );
+
+    return message.reply({
+      content:
+        `⚠️ This handle is **not** part of the RSI org.\n\n` +
+        `Do you want to continue anyway?\n\n` +
+        `You will be verified as a **non-org member**.\n` +
+        `Handle: **${handle}**`,
+      components: [row],
+    });
   }
 
   console.log(`[HANDLE VALID] "${handle}" found in org (rank: ${orgMember.rank})`);
@@ -172,19 +203,17 @@ async function handleOnboardingInput(message, handle) {
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`onboard_yes_${discordId}`)
-      .setLabel("Yes, that's me!")
+      .setCustomId(`manual_yes_${resolvedHandle}`)
+      .setLabel('✅ Confirm')
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
-      .setCustomId(`onboard_no_${discordId}`)
-      .setLabel('No, different handle')
+      .setCustomId(`manual_no`)
+      .setLabel('❌ Retry')
       .setStyle(ButtonStyle.Danger)
   );
 
   await message.reply({
-    content:
-      `✅ Found **${resolvedHandle}** in the org (rank: **${orgMember.rank}**).\n\n` +
-      `Is this your RSI account?`,
+    content: `Found: **${resolvedHandle}** (rank: **${orgMember.rank}**)\n\nIs this correct?`,
     components: [row],
   });
 }
@@ -221,6 +250,61 @@ async function completeVerification(message, rsiHandle, orgMember) {
   return message.reply(`Verified! Your RSI handle \`${rsiHandle}\` has been linked to your Discord account.`);
 }
 
+// ─── Self-healing sync: fix nicknames + roles for all verified users ─────────
+
+async function syncMembers(guild) {
+  console.log('[SYNC] Starting full sync...');
+
+  const verifiedUsers = load(); // { discordId: handle }
+  const rsiMembers = membersRef.members;
+
+  for (const [discordId, handle] of Object.entries(verifiedUsers)) {
+    try {
+      const member = await guild.members.fetch(discordId).catch(() => null);
+      if (!member) continue;
+
+      const orgMatch = rsiMembers.find(
+        (m) => (m.handle || m.name).toLowerCase() === handle.toLowerCase()
+      );
+
+      // Fix nickname if wrong
+      if (member.nickname !== handle) {
+        try {
+          await member.setNickname(handle);
+          console.log(`[SYNC] Fixed nickname for ${handle}`);
+        } catch (e) {
+          console.log(`[SYNC] Failed nickname update for ${handle}: ${e.message}`);
+        }
+      }
+
+      // Fix roles
+      const nonOrgRole = guild.roles.cache.find((r) => r.name.toLowerCase() === 'non-org');
+
+      if (orgMatch) {
+        // Org member — assign org role, remove non-org if present
+        const roleStr = orgMatch.role || orgMatch.rank || '';
+        for (const roleName of roleStr.split(',').map((r) => r.trim()).filter(Boolean)) {
+          await assignRoleToMember(guild, member, roleName).catch(() => {});
+        }
+        if (nonOrgRole && member.roles.cache.has(nonOrgRole.id)) {
+          await member.roles.remove(nonOrgRole);
+          console.log(`[SYNC] Removed non-org role from org member ${handle}`);
+        }
+      } else {
+        // Non-org member — ensure non-org role is present
+        if (nonOrgRole && !member.roles.cache.has(nonOrgRole.id)) {
+          await member.roles.add(nonOrgRole);
+          console.log(`[SYNC] Re-added non-org role to ${handle}`);
+        }
+      }
+    } catch (err) {
+      console.log('[SYNC ERROR]', err.message);
+    }
+  }
+
+  console.log('[SYNC] Completed.');
+}
+
 // ─── ClientReady ────────────────────────────────────────────────────────────
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -239,6 +323,20 @@ client.once(Events.ClientReady, async (readyClient) => {
     await syncRoles(guild, membersRef.members);
 
     scheduleWeeklySync(guild, membersRef, pendingDmConfirmations);
+
+    // Run self-healing sync on startup
+    await syncMembers(guild);
+
+    // Schedule self-healing sync every 10 minutes
+    setInterval(async () => {
+      try {
+        const g = client.guilds.cache.get(config.guildId);
+        if (g) await syncMembers(g);
+      } catch (err) {
+        console.error('[SYNC INTERVAL] Failed:', err.message);
+      }
+    }, 10 * 60 * 1000);
+
   } catch (err) {
     console.error('[startup] Failed:', err.message);
   }
@@ -302,24 +400,30 @@ client.on(Events.GuildMemberAdd, async (member) => {
       return startOnboarding(member);
     }
 
-    setUser(member.id, handle);
-
-    try {
-      const ranks = bestMatch.rank.split(',').map((r) => r.trim()).filter(Boolean);
-      for (const rank of ranks) {
-        await assignRoleToMember(member.guild, member, rank);
-      }
-      await updateNickname(member.guild, member, handle);
-    } catch (err) {
-      console.error('[JOIN FLOW] Role/nickname update failed:', err.message);
-    }
-
+    // Ask for confirmation before verifying
     try {
       const dm = await member.user.createDM();
-      await dm.send(
-        `✅ Welcome! You've been automatically verified as **${handle}** and your org roles have been assigned.`
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`verify_yes_${handle}`)
+          .setLabel("✅ Yes, that's me")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`verify_no`)
+          .setLabel('❌ No')
+          .setStyle(ButtonStyle.Danger)
       );
-    } catch (e) { /* silent */ }
+      await dm.send({
+        content:
+          `👀 I found a possible match:\n\n` +
+          `Handle: **${handle}**\n` +
+          `Display Name: **${bestMatch.displayName || handle}**`,
+        components: [row],
+      });
+      pendingOnboarding.set(member.id, { state: 'awaiting_confirm', guildId: member.guild.id, handle, orgMember: bestMatch });
+    } catch (e) {
+      console.warn(`[JOIN FLOW] Could not DM ${member.user.tag}: ${e.message}`);
+    }
 
     return;
   }
@@ -335,21 +439,36 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   const oldName = oldMember.displayName;
   const newName = newMember.displayName;
 
-  // Only care about nickname changes
   if (oldName === newName) return;
 
-  console.log('[NICK CHANGE DETECTED]', {
-    user: newMember.user.username,
-    oldName,
-    newName,
-  });
+  console.log('[NICK CHANGE DETECTED]', { user: newMember.user.username, oldName, newName });
 
-  // Only enforce for verified users
   const correctHandle = getUser(newMember.id);
   if (!correctHandle) return;
 
-  // Nickname already matches — nothing to do
   if (newName === correctHandle) return;
+
+  // ── Fetch audit log to find who made the change ───────────────────────────
+  let offender = newMember; // default: assume self-rename
+  try {
+    const fetchedLogs = await newMember.guild.fetchAuditLogs({ limit: 1, type: 24 });
+    const log = fetchedLogs.entries.first();
+    if (log) {
+      const { executor, target } = log;
+      const timeDiff = Date.now() - log.createdTimestamp;
+      // Only trust this log entry if it matches this event and is recent
+      if (target.id === newMember.id && timeDiff < 5000) {
+        offender = await newMember.guild.members.fetch(executor.id).catch(() => newMember);
+      }
+    }
+  } catch (err) {
+    console.warn('[NICKNAME VIOLATION] Could not fetch audit log:', err.message);
+  }
+
+  console.log('[NICKNAME VIOLATION]', {
+    offender: offender.user.tag,
+    target: newMember.user.tag,
+  });
 
   // ── Revert nickname ────────────────────────────────────────────────────────
   try {
@@ -359,32 +478,32 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
     console.warn(`[NICKNAME VIOLATION] Could not revert ${newMember.user.username}: ${err.message}`);
   }
 
-  // ── Track violation attempts ───────────────────────────────────────────────
-  const attempts = (nickViolations.get(newMember.id) || 0) + 1;
-  nickViolations.set(newMember.id, attempts);
+  // ── Track violation on the offender ───────────────────────────────────────
+  const attempts = (nickViolations.get(offender.id) || 0) + 1;
+  nickViolations.set(offender.id, attempts);
 
-  console.log('[NICKNAME VIOLATION]', { user: newMember.user.username, attempts });
-
-  // ── Warn user via DM ───────────────────────────────────────────────────────
+  // ── Warn offender via DM ───────────────────────────────────────────────────
   try {
-    const dm = await newMember.user.createDM();
-    await dm.send(
-      `⚠️ You are not allowed to change your nickname.\n` +
-      `It must match your RSI handle: **${correctHandle}**.\n\n` +
+    await offender.send(
+      `⚠️ You are not allowed to change nicknames.\n` +
+      `Nickname must match RSI handle: **${correctHandle}**\n\n` +
       `Repeated attempts may result in penalties.`
     );
-  } catch (e) { /* DMs may be closed */ }
+  } catch (e) {
+    console.log('[NICKNAME VIOLATION] Could not DM offender');
+  }
 
   // ── Escalate after 3 violations ───────────────────────────────────────────
   if (attempts >= 3) {
-    console.warn(`[NICKNAME ABUSE] ${newMember.user.tag} has violated nickname enforcement ${attempts} times`);
+    console.warn(`[NICKNAME ABUSE] ${offender.user.tag} has violated nickname enforcement ${attempts} times`);
 
     const adminCh = findAdminChannel(newMember.guild);
     if (adminCh) {
       try {
         await adminCh.send(
           `🚨 **Nickname abuse detected**\n` +
-          `User: ${newMember} (${newMember.user.tag})\n` +
+          `Offender: ${offender} (${offender.user.tag})\n` +
+          `Target: ${newMember} (${newMember.user.tag})\n` +
           `RSI handle: **${correctHandle}**\n` +
           `Violations: **${attempts}**\n` +
           `Last attempted nickname: \`${newName}\``
@@ -398,43 +517,22 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
 
 // ─── InteractionCreate (button presses) ─────────────────────────────────────
 
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isButton()) return;
+async function completeVerificationFromButton(interaction, handle) {
+  const userId = interaction.user.id;
+  const orgMember = membersRef.members.find(
+    (m) => (m.handle || m.name).toLowerCase() === handle.toLowerCase()
+  );
 
-  const { customId } = interaction;
-  if (!customId.startsWith('onboard_yes_') && !customId.startsWith('onboard_no_')) return;
-
-  const targetId = customId.split('_')[2];
-
-  if (interaction.user.id !== targetId) {
-    return interaction.reply({ content: 'This button is not for you.', ephemeral: true });
-  }
-
-  const session = pendingOnboarding.get(targetId);
-  if (!session || session.state !== 'awaiting_confirm') {
-    return interaction.reply({ content: 'This confirmation has expired. Please re-type your RSI handle.', ephemeral: true });
-  }
-
-  if (customId.startsWith('onboard_no_')) {
-    // Reset to awaiting_handle so they can try again
-    pendingOnboarding.set(targetId, { state: 'awaiting_handle', guildId: session.guildId });
-    return interaction.update({
-      content: `No problem! Please type your correct RSI handle in this DM.`,
-      components: [],
-    });
-  }
-
-  // YES — complete verification
-  const { handle, orgMember, guildId } = session;
-  pendingOnboarding.delete(targetId);
+  setUser(userId, handle);
+  pendingOnboarding.delete(userId);
   console.log(`[VERIFIED SUCCESS] ${interaction.user.tag} confirmed RSI handle: ${handle}`);
 
-  setUser(targetId, handle);
-
   try {
+    const guildId = interaction.guildId || pendingOnboarding.get(userId)?.guildId || config.guildId;
     const guild = await client.guilds.fetch(guildId);
-    const discordMember = await guild.members.fetch(targetId);
-    const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
+    const discordMember = await guild.members.fetch(userId);
+    const roleStr = (orgMember?.role || orgMember?.rank || '');
+    const ranks = roleStr.split(',').map((r) => r.trim()).filter(Boolean);
     for (const rank of ranks) {
       await assignRoleToMember(guild, discordMember, rank);
     }
@@ -447,6 +545,93 @@ client.on(Events.InteractionCreate, async (interaction) => {
     content: `✅ You've been verified as **${handle}**! Welcome to the org — your roles have been assigned.`,
     components: [],
   });
+}
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton()) return;
+
+  const { customId } = interaction;
+  const userId = interaction.user.id;
+
+  // ── Auto-match: user confirmed they are the matched RSI member ────────────
+  if (customId.startsWith('verify_yes_')) {
+    const handle = customId.slice('verify_yes_'.length);
+    return completeVerificationFromButton(interaction, handle);
+  }
+
+  // ── Auto-match: user denied — ask them to type their handle ───────────────
+  if (customId === 'verify_no') {
+    const session = pendingOnboarding.get(userId);
+    const guildId = session?.guildId || config.guildId;
+    pendingOnboarding.set(userId, { state: 'awaiting_handle', guildId });
+    return interaction.update({
+      content: `❌ No problem — please type your RSI handle.`,
+      components: [],
+    });
+  }
+
+  // ── Manual confirm: user confirmed typed handle ───────────────────────────
+  if (customId.startsWith('manual_yes_')) {
+    const handle = customId.slice('manual_yes_'.length);
+    return completeVerificationFromButton(interaction, handle);
+  }
+
+  // ── Manual retry: user wants to type a different handle ───────────────────
+  if (customId === 'manual_no') {
+    const session = pendingOnboarding.get(userId);
+    const guildId = session?.guildId || config.guildId;
+    pendingOnboarding.set(userId, { state: 'awaiting_handle', guildId });
+    return interaction.update({
+      content: `❌ Try again — please type your RSI handle.`,
+      components: [],
+    });
+  }
+
+  // ── Non-org: user confirmed they want to join as non-org member ────────────
+  if (customId.startsWith('nonorg_yes_')) {
+    const handle = customId.slice('nonorg_yes_'.length);
+    const member = interaction.member;
+
+    setUser(userId, handle);
+    pendingOnboarding.delete(userId);
+
+    // Assign non-org role — create it if it doesn't exist
+    try {
+      let nonOrgRole = member.guild.roles.cache.find(r => r.name === 'non-org');
+      if (!nonOrgRole) {
+        nonOrgRole = await member.guild.roles.create({ name: 'non-org', reason: 'Auto-created for non-org member verification' });
+        console.log('[NON-ORG] Created "non-org" role');
+      }
+      await member.roles.add(nonOrgRole);
+      await member.setNickname(handle).catch(() => {});
+    } catch (err) {
+      console.error('[NON-ORG] Role/nickname assignment failed:', err.message);
+    }
+
+    await notifyMods(
+      `ℹ️ **Non-org verification**\nUser: ${interaction.user.tag}\nHandle: \`${handle}\``
+    );
+
+    console.log(`[NON-ORG VERIFIED] ${interaction.user.tag} → handle: ${handle}`);
+
+    return interaction.update({
+      content:
+        `✅ You are now verified as a **non-org member**.\n` +
+        `Handle: **${handle}**`,
+      components: [],
+    });
+  }
+
+  // ── Non-org: user wants to retry with a different handle ──────────────────
+  if (customId === 'nonorg_no') {
+    const session = pendingOnboarding.get(userId);
+    const guildId = session?.guildId || config.guildId;
+    pendingOnboarding.set(userId, { state: 'awaiting_handle', guildId });
+    return interaction.update({
+      content: `❌ No problem — please type your handle again.`,
+      components: [],
+    });
+  }
 });
 
 // ─── MessageCreate ───────────────────────────────────────────────────────────
