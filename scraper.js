@@ -107,28 +107,37 @@ async function extractMembers(page, orgName, browser) {
       if (!html || html.length === 0) break;
 
       // Parse HTML into member objects inside browser context
-      const ROLE_NAMES = [
-        'affiliate', 'member', 'officer', 'founder', 'recruit', 'leader',
-        'admiral', 'commander', 'captain', 'veteran', 'staff', 'admin',
+      const roleKeywords = [
+        'officer', 'admiral', 'member', 'affiliate', 'recruit', 'leader',
+        'founder', 'commander', 'captain', 'veteran', 'staff', 'admin',
         'director', 'chief', 'head', 'deputy', 'corporal', 'sergeant',
       ];
       const container = document.createElement('div');
       container.innerHTML = html;
       container.querySelectorAll('[class*="member"]').forEach((card) => {
         const lines = card.innerText.split('\n').map(t => t.trim()).filter(Boolean);
-        // Debug: log card structure so we can see what lines[0/1/2+] contain
-        if (allMembers.length < 3) {
-          lines.forEach((line, i) => console.log(`[${i}]`, line));
-        }
-        if (lines.length >= 2) {
-          const displayName = lines[0];
-          const handle = lines[1];
-          const role = lines[2] || 'Member';
-          const isRole = ROLE_NAMES.includes(handle.toLowerCase());
-          if (!isRole && handle.length > 2) {
-            allMembers.push({ displayName, handle, role });
+        if (lines.length === 0) return;
+
+        const displayName = lines[0];
+
+        // Find first non-role line after displayName
+        let handle = null;
+        for (let i = 1; i < lines.length; i++) {
+          const value = lines[i];
+          const lower = value.toLowerCase();
+          const isRole = roleKeywords.includes(lower) ||
+            lower.includes('recruitment') ||
+            lower.includes('member');
+          if (!isRole && value.length >= 3) {
+            handle = value;
+            break;
           }
         }
+
+        // Fallback: use displayName if no valid handle found
+        if (!handle) handle = displayName;
+
+        allMembers.push({ displayName, handle });
       });
 
       console.log('[PAGE LOADED]', pageNum, '— members so far:', allMembers.length);
