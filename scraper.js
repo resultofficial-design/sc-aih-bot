@@ -112,7 +112,7 @@ async function extractMembers(page, orgName) {
 
   const extract = () => page.evaluate(() => {
     const RANK_KEYWORDS = ['officer', 'member', 'affiliate', 'recruit', 'branding', 'role'];
-    const clean = (str) => str.replace(/\s+/g, ' ').trim();
+    const cleanText = (str) => str.replace(/\s+/g, ' ').trim();
     const seen = new Set();
     const results = [];
 
@@ -126,23 +126,37 @@ async function extractMembers(page, orgName) {
       // Only consider leaf-ish elements with limited children
       if (el.children.length > 20) continue;
 
-      const nameEl = el.querySelector('[class*="name"], [class*="handle"], [class*="nick"]');
+      const handleEl = el.querySelector('[class*="handle"]');
+      const displayNameEl = el.querySelector('[class*="name"], [class*="nick"]');
       const rankEl = el.querySelector('[class*="rank"], [class*="role"]');
 
-      if (!nameEl || !rankEl) continue;
+      if (!rankEl) continue;
+      if (!handleEl && !displayNameEl) continue;
 
-      const nameParts = nameEl.textContent.split('\n').map(clean).filter(Boolean);
-      const name = nameParts[0] || '';
-      if (!name || seen.has(name) || name.length > 60) continue;
+      // Extract handle (strip leading @)
+      const rawHandle = handleEl
+        ? cleanText(handleEl.textContent.split('\n')[0]).replace(/^@/, '')
+        : '';
+      // Extract display name
+      const rawDisplayName = displayNameEl
+        ? cleanText(displayNameEl.textContent.split('\n')[0])
+        : '';
 
-      const rankParts = rankEl.textContent.split('\n').map(clean).filter((s) => s && s !== 'Roles');
+      // Handle is the primary identity; fall back to display name if no handle element
+      const handle = rawHandle || rawDisplayName;
+      const displayName = rawDisplayName || rawHandle;
+
+      if (!handle || seen.has(handle.toLowerCase()) || handle.length > 60) continue;
+
+      const rankParts = rankEl.textContent.split('\n').map(cleanText).filter((s) => s && s !== 'Roles');
       const rank = rankParts.join(', ') || 'Member';
       const hasRankKeyword = RANK_KEYWORDS.some((k) => rank.toLowerCase().includes(k));
       if (!hasRankKeyword && rank.length > 30) continue;
 
-      seen.add(name);
+      seen.add(handle.toLowerCase());
 
-      results.push({ name, rank });
+      // name = handle for backwards compatibility with all existing code
+      results.push({ displayName, handle, name: handle, rank });
     }
 
     if (results.length === 0) {
