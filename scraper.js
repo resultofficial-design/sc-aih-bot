@@ -95,102 +95,98 @@ async function extractMembers(page, orgName) {
     console.warn('[SCRAPER] Proceeding despite not confirming members page URL.');
   }
 
-  // Wait for member cards to appear
-  console.log('[scraper] Waiting for member cards...');
-  try {
-    await page.waitForSelector('[class*="member"]', { timeout: 15000 });
-    console.log('[scraper] Member cards found.');
-  } catch {
-    console.warn('[scraper] Member card selector timed out — proceeding anyway.');
-  }
-
-  // Scroll to trigger lazy loading
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await page.waitForTimeout(3000);
+  // Scroll slowly through the full page to trigger all lazy-loaded cards
+  console.log('[scraper] Scrolling page to load all members...');
+  await page.evaluate(async () => {
+    await new Promise((resolve) => {
+      const distance = 400;
+      const delay = 200;
+      const timer = setInterval(() => {
+        window.scrollBy(0, distance);
+        if (window.scrollY + window.innerHeight >= document.body.scrollHeight) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, delay);
+    });
+  });
+  await page.waitForTimeout(2000);
 
   const extract = () => page.evaluate(() => {
     const cleanText = (str) => (str || '').replace(/\s+/g, ' ').trim();
 
-    // Known RSI org role names — used to identify the role line reliably
-    const RSI_ROLES = [
-      'employee', 'officer', 'member', 'affiliate', 'recruit',
-      'admiral', 'director', 'manager', 'founder', 'veteran',
+    // UI text that should never be treated as a member name
+    const UI_JUNK = [
+      'search', 'reset', 'display users', 'filter', 'sort',
+      'prev', 'next', 'load more', 'showing', 'members',
+      'employee', 'officer', 'affiliate', 'recruit', 'admiral',
+      'director', 'manager', 'founder', 'veteran',
     ];
-
-    // Words that only appear in UI controls, never in a real member card
-    const INVALID_WORDS = ['search', 'reset', 'display users', 'filter', 'sort by'];
 
     const seen = new Set();
     const results = [];
 
-    // Try progressively broader selectors until we find individual cards
-    // li elements are most likely to be individual items in a member list
-    let cards = document.querySelectorAll('li[class*="member"]');
-    if (cards.length === 0) {
-      cards = document.querySelectorAll('[class*="member-item"], [class*="memberItem"], [class*="member_item"]');
+    // ── Step 1: log what every [class*="member"] selector finds ──────────────
+    const selectors = [
+      'li[class*="member"]',
+      '[class*="member-item"]',
+      '[class*="memberItem"]',
+      '[class*="member_item"]',
+      '[class*="org-member"]',
+      '[class*="orgMember"]',
+    ];
+    for (const sel of selectors) {
+      const n = document.querySelectorAll(sel).length;
+      if (n > 0) console.log(`[SEL HIT] ${sel} → ${n} elements`);
     }
-    if (cards.length === 0) {
-      cards = document.querySelectorAll('[class*="member"]');
-    }
-    console.log('[scraper] Card count:', cards.length);
 
+    // ── Step 2: find individual cards ────────────────────────────────────────
+    // Try specific selectors in order; fall back to the generic one filtered
+    // by line count so we skip containers.
+    let cards = [];
+    for (const sel of selectors) {
+      const found = document.querySelectorAll(sel);
+      if (found.length > 0) { cards = Array.from(found); break; }
+    }
+
+    if (cards.length === 0) {
+      // Generic fallback: any [class*="member"] element with ≤ 8 text lines
+      cards = Array.from(document.querySelectorAll('[class*="member"]')).filter((el) => {
+        const lines = el.innerText.split('\n').map(t => t.trim()).filter(Boolean);
+        return lines.length >= 1 && lines.length <= 8;
+      });
+      console.log(`[SEL FALLBACK] filtered [class*="member"]: ${cards.length} elements`);
+    }
+
+    console.log('[scraper] Cards to process:', cards.length);
+
+    // Log the first card's raw lines so we can verify structure
+    if (cards.length > 0) {
+      const sample = cards[0].innerText.split('\n').map(t => t.trim()).filter(Boolean);
+      console.log('[CARD SAMPLE lines]', sample);
+    }
+
+    // ── Step 3: extract name from line 0 of each card ────────────────────────
     cards.forEach((card) => {
       const lines = card.innerText
         .split('\n')
         .map((t) => cleanText(t))
         .filter(Boolean);
 
-      // Individual cards have 2–8 lines; anything more is a container element
-      if (lines.length < 2 || lines.length > 8) return;
+      if (lines.length === 0) return;
 
-      // Line 0 is always the display name (the primary identity — same as old system)
-      const displayName = lines[0];
+      const name = lines[0];
 
-      if (!displayName || displayName.length < 2 || displayName.length > 60) return;
-      if (seen.has(displayName.toLowerCase())) return;
+      if (!name || name.length < 2 || name.length > 60) return;
+      if (seen.has(name.toLowerCase())) return;
+      if (UI_JUNK.some((w) => name.toLowerCase().includes(w))) return;
 
-      // Reject cards where the name looks like UI text
-      const isInvalid = INVALID_WORDS.some(
-        (w) => displayName.toLowerCase().includes(w)
-      );
-      if (isInvalid) return;
-
-      // lines[1] might be the handle OR the role (when displayName === handle,
-      // some cards skip the duplicate and show the role directly on line 1).
-      // Detect which by checking if lines[1] is a known RSI role word.
-      const line1 = lines[1] || '';
-      const line1IsRole = RSI_ROLES.some(
-        (r) => line1.toLowerCase() === r || line1.toLowerCase().startsWith(r)
-      );
-
-      // Handle: use lines[1] only when it isn't a role word
-      const handle = line1IsRole
-        ? displayName                          // handle same as display name
-        : line1.replace(/^@/, '');
-
-      // Find role: scan from the end for the first line that is a known RSI role
-      const roleSearchStart = line1IsRole ? 1 : 2;
-      let role = 'Member';
-      for (let i = lines.length - 1; i >= roleSearchStart; i--) {
-        const lc = lines[i].toLowerCase();
-        if (RSI_ROLES.some((r) => lc === r || lc.startsWith(r))) {
-          role = lines[i];
-          break;
-        }
-      }
-
-      seen.add(displayName.toLowerCase());
-
-      // name = displayName — primary identity for matching (same as old system)
-      // handle stored alongside for reference
-      // rank  = alias for role, keeps all existing code working
-      results.push({ displayName, handle, name: displayName, role, rank: role });
+      seen.add(name.toLowerCase());
+      // role/rank default to 'Member' for now — will be re-added once names work
+      results.push({ name, displayName: name, handle: name, role: 'Member', rank: 'Member' });
     });
 
-    if (results.length === 0) {
-      console.log('[scraper] Page preview (no results):', document.body.innerText.slice(0, 500));
-    }
-
+    console.log('[EXTRACTED NAMES]', results.map((r) => r.name));
     return results;
   });
 
@@ -215,7 +211,7 @@ async function extractMembers(page, orgName) {
     console.warn('[SCRAPER WARNING] Possibly incomplete member list — only', members.length, 'member(s) returned');
   }
 
-  console.log('[SCRAPER] Members found:', members.map((m) => m.handle));
+  console.log('[SCRAPER] Members found:', members.map((m) => m.name));
   console.log('[SYNC] Proceeding with sync using', members.length, 'members');
   return members;
 }
