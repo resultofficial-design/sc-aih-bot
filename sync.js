@@ -32,9 +32,19 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
   const unmatched = [];
 
   for (const [discordId, rsiHandle] of Object.entries(verifiedUsers)) {
-    const orgMember = freshMembers.find(
-      (m) => m.name.toLowerCase() === rsiHandle.toLowerCase()
+    // Try to find org member by handle (primary), then fall back to displayName
+    // (handles data stored before the handle-as-identity migration)
+    let orgMember = freshMembers.find(
+      (m) => (m.handle || m.name).toLowerCase() === rsiHandle.toLowerCase()
     );
+    if (!orgMember) {
+      orgMember = freshMembers.find(
+        (m) => (m.displayName || '').toLowerCase() === rsiHandle.toLowerCase()
+      );
+      if (orgMember) {
+        console.log(`[HANDLE MIGRATION] ${discordId}: stored "${rsiHandle}" matched displayName → correct handle is "${orgMember.handle || orgMember.name}"`);
+      }
+    }
 
     let discordMember;
     try {
@@ -51,10 +61,41 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
       continue;
     }
 
+    const correctHandle = orgMember.handle || orgMember.name;
+
+    // Determine what needs updating
+    const handleMismatch = rsiHandle !== correctHandle;
+    const nicknameMismatch = discordMember.displayName !== correctHandle;
+
     const expectedRanks = new Set(
       orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean)
     );
 
+    let rolesMissing = false;
+    let rolesExtra = false;
+    for (const rank of expectedRanks) {
+      const role = guild.roles.cache.find((r) => r.name === rank);
+      if (role && !discordMember.roles.cache.has(role.id)) { rolesMissing = true; break; }
+    }
+    if (!rolesMissing) {
+      for (const role of discordMember.roles.cache.values()) {
+        if (isManagedRole(role.id) && !expectedRanks.has(role.name)) { rolesExtra = true; break; }
+      }
+    }
+
+    // Skip only when everything is already in the correct state
+    if (!handleMismatch && !nicknameMismatch && !rolesMissing && !rolesExtra) {
+      console.log(`[SKIP - ALREADY CORRECT] ${discordMember.user.tag} (${correctHandle})`);
+      continue;
+    }
+
+    // Fix stored handle if it differs from the authoritative org handle
+    if (handleMismatch) {
+      console.log(`[UPDATED HANDLE] ${discordMember.user.tag}: old="${rsiHandle}" → new="${correctHandle}"`);
+      setUser(discordId, correctHandle);
+    }
+
+    // Add missing roles
     for (const rank of expectedRanks) {
       const role = guild.roles.cache.find((r) => r.name === rank);
       if (role && !discordMember.roles.cache.has(role.id)) {
@@ -64,17 +105,20 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
       }
     }
 
+    // Remove stale managed roles
     for (const role of discordMember.roles.cache.values()) {
       if (isManagedRole(role.id) && !expectedRanks.has(role.name)) {
-        console.log(`[sync] Attempting to remove managed role "${role.name}" from ${discordMember.user.tag}`);
+        console.log(`[sync] Removing stale role "${role.name}" from ${discordMember.user.tag}`);
         await discordMember.roles.remove(role);
         console.log(`[sync] Removed role "${role.name}" from ${discordMember.user.tag}`);
         rolesRemoved++;
       }
     }
 
-    // Update nickname to RSI handle
-    await updateNickname(guild, discordMember, orgMember.name);
+    // Always ensure nickname matches the correct handle
+    if (nicknameMismatch) {
+      await updateNickname(guild, discordMember, correctHandle);
+    }
 
     updated++;
   }
@@ -99,9 +143,19 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
     const rsiName = orgMember.name;
     const rsiClean = clean(rsiName);
 
-    // Skip only if already claimed by a member who is still in the guild
+    // If already claimed and member is in guild, ensure nickname is correct then skip.
+    // (Role updates are handled by processVerifiedUsers — this only catches stale nicknames.)
     const existingId = getUserByHandle(rsiName);
-    if (existingId && guild.members.cache.has(existingId)) continue;
+    if (existingId && guild.members.cache.has(existingId)) {
+      const existingMember = guild.members.cache.get(existingId);
+      if (existingMember && existingMember.displayName !== rsiName) {
+        console.log(`[NICKNAME FIX] ${existingMember.user.tag}: nickname "${existingMember.displayName}" → "${rsiName}"`);
+        await updateNickname(guild, existingMember, rsiName);
+      } else {
+        console.log(`[SKIP - ALREADY CORRECT] ${existingMember?.user.tag} → ${rsiName}`);
+      }
+      continue;
+    }
 
     // Build candidates using STRICT two-part rule + fallback tier
     const candidates = [];
