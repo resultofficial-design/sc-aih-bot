@@ -82,72 +82,132 @@ async function scrapeProfile(browser, url) {
 async function extractMembers(page, orgName, browser) {
   const membersUrl = `${RSI_HOME_URL}/orgs/${orgName}/members`;
 
-  // ── Step 1: Load the org members page ──────────────────────────────────────
-  console.log(`[SCRAPER] Navigating to org members page: ${membersUrl}`);
+  // ── Step 1: Intercept API responses before navigating ──────────────────────
+  // Playwright fires 'response' for every network response — no setup needed.
+  // We listen broadly and filter down to JSON payloads that look like member data.
+  let membersData = [];
+
+  page.on('response', async (response) => {
+    const url = response.url();
+
+    // Only look at endpoints that could plausibly return member data
+    const relevant =
+      url.includes('/api/') ||
+      url.includes('members') ||
+      url.includes('orgs') ||
+      url.includes('citizens');
+    if (!relevant) return;
+
+    const ct = response.headers()['content-type'] || '';
+    if (!ct.includes('application/json')) return;
+
+    try {
+      const data = await response.json();
+      console.log('[API RESPONSE]', url, '→ top-level keys:', Object.keys(data || {}).join(', '));
+
+      // Try every common RSI API response envelope shape
+      const candidates = [
+        data?.data,
+        data?.members,
+        data?.result,
+        data?.hits,
+        Array.isArray(data) ? data : null,
+      ].filter(Array.isArray);
+
+      for (const arr of candidates) {
+        if (arr.length === 0) continue;
+        const first = arr[0];
+        // Must look like a member object
+        if (!first.handle && !first.nickname && !first.name) continue;
+
+        const extracted = arr
+          .map((m) => ({
+            handle: (m.handle || m.nickname || m.name || '').trim(),
+            displayName: (m.displayName || m.display_name || m.name || m.handle || '').trim(),
+            role: (m.rank || m.role || 'Member').trim(),
+          }))
+          .filter((m) => m.handle.length >= 2);
+
+        if (extracted.length > membersData.length) {
+          membersData = extracted;
+          console.log('[API MEMBERS FOUND]', membersData.length, 'members from', url);
+        }
+      }
+    } catch (e) {
+      // Not JSON or body already consumed — skip silently
+    }
+  });
+
+  // ── Step 2: Navigate and let the page trigger its own API calls ────────────
+  console.log('[SCRAPER] Loading org page — waiting for API responses...');
   await page.goto(membersUrl, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
-  await page.waitForLoadState('domcontentloaded');
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(2000);
 
-  const currentUrl = page.url();
-  console.log('[SCRAPER] Current URL:', currentUrl);
-  if (!currentUrl.includes('/members')) {
-    console.warn('[SCRAPER] Warning: not confirmed on /members URL — continuing anyway');
-  }
-
-  // ── Step 2: Scroll to load all lazy-rendered profile links ────────────────
-  console.log('[scraper] Scrolling to load all profile links...');
+  // Scroll to trigger any lazy-loaded API calls
   await page.evaluate(async () => {
     await new Promise((resolve) => {
       const timer = setInterval(() => {
         window.scrollBy(0, 400);
         if (window.scrollY + window.innerHeight >= document.body.scrollHeight) {
-          clearInterval(timer);
-          resolve();
+          clearInterval(timer); resolve();
         }
       }, 200);
     });
   });
   await page.waitForTimeout(2000);
 
-  // ── Step 3: Collect all unique /citizens/ profile URLs ─────────────────────
-  const rawLinks = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('a[href*="/citizens/"]'))
-      .map((a) => a.href)
-  );
+  // ── Step 3: Wait up to 15s for API data ───────────────────────────────────
+  const deadline = Date.now() + 15000;
+  while (membersData.length === 0 && Date.now() < deadline) {
+    await page.waitForTimeout(500);
+  }
 
+  if (membersData.length > 0) {
+    const results = membersData.map((m) => ({
+      name: m.handle,
+      displayName: m.displayName || m.handle,
+      handle: m.handle,
+      role: m.role,
+      rank: m.role,  // rank alias for backwards compat
+    }));
+    console.log('[FINAL MEMBERS COUNT]', results.length);
+    console.log('[SAMPLE]', results.slice(0, 5));
+    console.log('[SCRAPER] Members found:', results.map((m) => m.handle));
+    console.log('[SYNC] Proceeding with sync using', results.length, 'members');
+    return results;
+  }
+
+  // ── Step 4: Fallback — parallel profile page scraping ─────────────────────
+  console.warn('[SCRAPER] No API data captured — falling back to profile page scraping');
+
+  const rawLinks = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('a[href*="/citizens/"]')).map((a) => a.href)
+  );
   const uniqueLinks = [...new Set(rawLinks)];
   console.log('[PROFILE LINKS FOUND]', uniqueLinks.length);
 
   if (uniqueLinks.length === 0) {
-    throw new Error('Scraper failed: no /citizens/ profile links found on org page');
+    throw new Error('Scraper failed: no API data and no /citizens/ profile links found');
   }
 
-  // ── Step 4: Scrape profiles in parallel batches ────────────────────────────
   const results = [];
   const totalBatches = Math.ceil(uniqueLinks.length / CONCURRENCY);
 
   for (let i = 0; i < uniqueLinks.length; i += CONCURRENCY) {
     const batch = uniqueLinks.slice(i, i + CONCURRENCY);
     const batchNum = Math.floor(i / CONCURRENCY) + 1;
-    console.log(`[BATCH ${batchNum}/${totalBatches}] Scraping profiles ${i + 1}–${Math.min(i + CONCURRENCY, uniqueLinks.length)} of ${uniqueLinks.length}`);
+    console.log(`[BATCH ${batchNum}/${totalBatches}] profiles ${i + 1}–${Math.min(i + CONCURRENCY, uniqueLinks.length)} of ${uniqueLinks.length}`);
 
-    const batchResults = await Promise.all(
-      batch.map((url) => scrapeProfile(browser, url))
-    );
+    const batchResults = await Promise.all(batch.map((url) => scrapeProfile(browser, url)));
 
-    for (const result of batchResults) {
-      if (result && result.handle && result.handle.length >= 2) {
+    for (const r of batchResults) {
+      if (r?.handle?.length >= 2) {
         results.push({
-          name: result.handle,
-          displayName: result.handle,
-          handle: result.handle,
-          role: 'Member',
-          rank: 'Member',
-          profileUrl: result.url,
+          name: r.handle, displayName: r.handle, handle: r.handle,
+          role: 'Member', rank: 'Member', profileUrl: r.url,
         });
       }
     }
-
     console.log('[PROGRESS]', results.length, '/', uniqueLinks.length);
   }
 
@@ -155,11 +215,7 @@ async function extractMembers(page, orgName, browser) {
   console.log('[SAMPLE]', results.slice(0, 5));
 
   if (results.length === 0) {
-    throw new Error('Scraper failed: visited profiles but extracted 0 valid handles');
-  }
-
-  if (results.length < uniqueLinks.length * 0.5) {
-    console.warn(`[SCRAPER WARNING] Only got ${results.length} handles from ${uniqueLinks.length} profile links`);
+    throw new Error('Scraper failed: both API interception and profile scraping returned 0 members');
   }
 
   console.log('[SCRAPER] Members found:', results.map((m) => m.handle));
