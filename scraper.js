@@ -106,38 +106,34 @@ async function extractMembers(page, orgName, browser) {
       total = data.data.totalrows || total;
       if (!html || html.length === 0) break;
 
-      // Parse HTML into member objects inside browser context
-      const roleKeywords = [
-        'officer', 'admiral', 'member', 'affiliate', 'recruit', 'leader',
-        'founder', 'commander', 'captain', 'veteran', 'staff', 'admin',
-        'director', 'chief', 'head', 'deputy', 'corporal', 'sergeant',
-      ];
+      // Parse HTML using DOM structure — no innerText guesswork
       const container = document.createElement('div');
       container.innerHTML = html;
-      container.querySelectorAll('[class*="member"]').forEach((card) => {
-        const lines = card.innerText.split('\n').map(t => t.trim()).filter(Boolean);
-        if (lines.length === 0) return;
+      const items = container.querySelectorAll('li');
+      items.forEach((item) => {
+        const link = item.querySelector('a[href*="/citizens/"]');
+        if (!link) return; // skip non-members
 
-        const displayName = lines[0];
+        // Handle is always the last segment of the profile URL
+        const profileUrl = link.getAttribute('href');
+        const handle = profileUrl.split('/').pop();
+        if (!handle || handle.length < 2) return;
 
-        // Find first non-role line after displayName
-        let handle = null;
-        for (let i = 1; i < lines.length; i++) {
-          const value = lines[i];
-          const lower = value.toLowerCase();
-          const isRole = roleKeywords.includes(lower) ||
-            lower.includes('recruitment') ||
-            lower.includes('member');
-          if (!isRole && value.length >= 3) {
-            handle = value;
-            break;
-          }
+        const displayName = link.textContent.trim() || handle;
+
+        // Role from dedicated element, avoiding name/handle repetition
+        let role = 'Member';
+        const roleEl =
+          item.querySelector('[class*="rank"]') ||
+          item.querySelector('[class*="role"]') ||
+          item.querySelector('p') ||
+          item.querySelector('span');
+        if (roleEl) {
+          const text = roleEl.textContent.trim();
+          if (text && text !== displayName && text !== handle) role = text;
         }
 
-        // Fallback: use displayName if no valid handle found
-        if (!handle) handle = displayName;
-
-        allMembers.push({ displayName, handle });
+        allMembers.push({ displayName, handle, role });
       });
 
       console.log('[PAGE LOADED]', pageNum, '— members so far:', allMembers.length);
