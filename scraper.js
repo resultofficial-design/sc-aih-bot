@@ -94,11 +94,19 @@ async function extractMembers(page, orgName, browser) {
     const relevant = url.includes('/members') || url.includes('/organization');
     if (!relevant) return;
 
+    // Ignore non-JSON responses
     const ct = response.headers()['content-type'] || '';
     if (!ct.includes('application/json')) return;
+    if (!response.ok()) return;
+
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      return; // body already consumed or not valid JSON
+    }
 
     try {
-      const data = await response.json();
       console.log('[API RESPONSE]', url, '→ top-level keys:', Object.keys(data || {}).join(', '));
 
       // Try every common RSI API response envelope shape
@@ -129,8 +137,8 @@ async function extractMembers(page, orgName, browser) {
           console.log('[API MEMBERS FOUND]', membersData.length, 'members from', url);
         }
       }
-    } catch (e) {
-      // Not JSON or body already consumed — skip silently
+    } catch {
+      // skip silently
     }
   });
 
