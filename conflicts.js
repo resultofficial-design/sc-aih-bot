@@ -1,6 +1,7 @@
 const { similarity } = require('./fuzzy');
-const { removeUser } = require('./users');
+const { removeUser, setUser } = require('./users');
 const { isManagedRole } = require('./roles');
+const { updateNickname } = require('./nicknames');
 
 // Persists across sync runs so !conflicts can display them
 // Map: rsiName → [{ discordId, discordTag, signals }]
@@ -18,13 +19,19 @@ function hasCorrectRole(discordMember, rsiName, freshMembers, guild) {
   });
 }
 
+const clean = (str) => (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
 // Build a signals object for a candidate — used for sorting and logging
 function getSignals(discordMember, rsiName, verifiedUsers, freshMembers, guild) {
+  const rsiClean = clean(rsiName);
+  console.log('[CLEAN TEST]', { original: rsiName, cleaned: rsiClean });
+  const usernameSim = similarity(clean(discordMember?.user?.username), rsiClean);
+  const displaySim = similarity(clean(discordMember?.displayName), rsiClean);
   return {
     discordId: discordMember.id,
     discordTag: discordMember.user.tag,
     isVerified: verifiedUsers[discordMember.id]?.toLowerCase() === rsiName.toLowerCase(),
-    usernameSim: similarity(discordMember.user.username, rsiName),
+    usernameSim: Math.max(usernameSim, displaySim),
     joinedAt: discordMember.joinedTimestamp || Infinity,
     hasCorrectRole: hasCorrectRole(discordMember, rsiName, freshMembers, guild),
   };
@@ -92,7 +99,8 @@ async function handleImposter(guild, discordMember, rsiName) {
   }
 }
 
-async function resolveConflicts(guild, freshMembers, verifiedUsers) {
+async function resolveConflicts(guild, freshMembers, verifiedUsers, options = {}) {
+  const { assignRanks = null, channel = null } = options;
   console.log('[REVALIDATION] Checking existing verified users...');
   unresolvedConflicts.clear();
 
@@ -125,25 +133,27 @@ async function resolveConflicts(guild, freshMembers, verifiedUsers) {
 
     if (candidateMap.size === 0) continue;
 
-    // Debug: log ALL candidates above 0.5 similarity for this RSI name
+    // Debug: log ALL candidates above 0.4 similarity for this RSI name
+    const rsiClean = clean(rsiName);
     guild.members.cache.forEach((member) => {
       const username = member.user.username;
-      const nickname = member.nickname || '';
-      const usernameScore = similarity(username, rsiName);
-      const nicknameScore = similarity(nickname, rsiName);
-      if (usernameScore > 0.5 || nicknameScore > 0.5) {
+      const displayName = member.displayName || '';
+      console.log('[SCAN]', username, displayName);
+      const usernameScore = similarity(clean(username), rsiClean);
+      const nicknameScore = similarity(clean(displayName), rsiClean);
+      if (usernameScore > 0.4 || nicknameScore > 0.4) {
         console.log('[CANDIDATE FOUND]');
         console.log('RSI:', rsiName);
         console.log('User:', username);
-        console.log('Nickname:', nickname);
+        console.log('DisplayName:', displayName);
         console.log('Scores:', { usernameScore: usernameScore.toFixed(3), nicknameScore: nicknameScore.toFixed(3) });
       }
     });
 
-    // Scan all guild members for unverified challengers via USERNAME similarity only
+    // Scan all guild members for unverified challengers via normalized similarity
     const lowestVerifiedSim = Math.min(
       ...Array.from(candidateMap.values()).map((m) =>
-        similarity(m.user.username, rsiName)
+        similarity(clean(m?.user?.username), rsiClean)
       )
     );
 
@@ -151,10 +161,14 @@ async function resolveConflicts(guild, freshMembers, verifiedUsers) {
       if (discordMember.user.bot) continue;
       if (candidateMap.has(discordId)) continue;
 
-      const usernameSim = similarity(discordMember.user.username, rsiName);
+      const usernameClean = clean(discordMember.user.username);
+      const displayClean = clean(discordMember.displayName || '');
+      const usernameSim = similarity(usernameClean, rsiClean);
+      const displaySim = similarity(displayClean, rsiClean);
+      const bestSim = Math.max(usernameSim, displaySim);
 
-      // Only flag as a challenger if username is very close AND beats the weakest claimant
-      if (usernameSim >= 0.85 && usernameSim > lowestVerifiedSim) {
+      // Only flag as a challenger if very close AND beats the weakest claimant
+      if (bestSim >= 0.85 && bestSim > lowestVerifiedSim) {
         candidateMap.set(discordId, discordMember);
       }
     }
@@ -193,13 +207,49 @@ async function resolveConflicts(guild, freshMembers, verifiedUsers) {
     }
 
     const [real, ...imposters] = ranked;
-    console.log(`[ID CHECK] Real: ${real.discordId} (${real.discordTag})`);
 
+    console.log(`[FINAL] Winner: ${real.discordTag}`);
+    console.log(`[FINAL] Impostors: ${imposters.map((i) => i.discordTag).join(', ') || 'none'}`);
+
+    // --- Auto-link and verify the real user ---
+    const realMember = guild.members.cache.get(real.discordId);
+    if (realMember) {
+      setUser(real.discordId, rsiName);
+      const orgMember = freshMembers.find((m) => m.name.toLowerCase() === rsiNameLower);
+      if (orgMember && assignRanks) {
+        await assignRanks(guild, realMember, orgMember);
+      }
+      await updateNickname(guild, realMember, rsiName);
+      console.log(`[AUTO-LINK] Real user verified: ${realMember.user.tag}`);
+
+      // Notify winner via DM
+      try {
+        const dm = await realMember.user.createDM();
+        await dm.send(
+          `✅ You have been automatically verified as **${rsiName}** and your roles have been assigned.`
+        );
+      } catch (e) {
+        console.warn(`[DM FAILED] Could not DM winner ${realMember.user.tag}`);
+      }
+    }
+
+    // --- Handle each impostor ---
     for (const imposter of imposters) {
       const discordMember = guild.members.cache.get(imposter.discordId);
       if (!discordMember) continue;
       console.log(`[ID CHECK] Imposter: ${imposter.discordId} (${imposter.discordTag})`);
       await handleImposter(guild, discordMember, rsiName);
+
+      // Public channel warning
+      if (channel) {
+        try {
+          await channel.send(
+            `⚠️ ${discordMember} was removed from an incorrect RSI identity (**${rsiName}**).`
+          );
+        } catch (e) {
+          console.warn(`[CHANNEL WARN] Could not send public warning for ${discordMember.user.tag}`);
+        }
+      }
     }
 
     resolved++;

@@ -51,25 +51,49 @@ async function login(page) {
 
 async function extractMembers(page, orgName) {
   const membersUrl = `${RSI_HOME_URL}/orgs/${orgName}/members`;
+  const MAX_NAV_RETRIES = 3;
+  let onMembersPage = false;
 
-  console.log(`[scraper] Navigating to org page: ${membersUrl}`);
-  await page.goto(membersUrl, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
-  await page.waitForLoadState('domcontentloaded');
-  await page.waitForTimeout(5000);
-
-  // Confirm we're on the right page
-  const currentUrl = page.url();
-  console.log('[scraper] Current URL:', currentUrl);
-  if (!currentUrl.includes('/members')) {
-    console.warn('[scraper] Not on members page — navigating again...');
+  for (let navAttempt = 1; navAttempt <= MAX_NAV_RETRIES; navAttempt++) {
+    console.log(`[SCRAPER] Navigation attempt ${navAttempt} to: ${membersUrl}`);
     await page.goto(membersUrl, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
-    await page.waitForTimeout(5000);
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(3000);
+
+    const currentUrl = page.url();
+    console.log('[SCRAPER] Current URL:', currentUrl);
+
+    if (!currentUrl.includes('/members')) {
+      console.warn(`[SCRAPER] Not on members page (attempt ${navAttempt}) — retrying...`);
+      if (navAttempt < MAX_NAV_RETRIES) {
+        await page.waitForTimeout(2000);
+        continue;
+      }
+      console.warn('[SCRAPER] Could not reach members page after all retries.');
+      break;
+    }
+
+    onMembersPage = true;
+
+    // Wait for members content to appear
+    try {
+      await page.waitForSelector('.member-list, .members, [data-members]', { timeout: 10000 });
+      console.log('[SCRAPER] Members selector found.');
+    } catch {
+      console.warn('[SCRAPER] Members selector not found — proceeding anyway.');
+    }
+
+    break;
   }
 
   // Log page content size and preview
   const pageText = await page.evaluate(() => document.body.innerText);
   console.log('[scraper] Page text length:', pageText.length);
   console.log('[scraper] Page preview:', pageText.slice(0, 300));
+
+  if (!onMembersPage) {
+    console.warn('[SCRAPER] Proceeding despite not confirming members page URL.');
+  }
 
   // Scroll to trigger lazy loading
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
@@ -147,6 +171,11 @@ async function extractMembers(page, orgName) {
     throw new Error('No members found');
   }
 
+  if (members.length < 2) {
+    console.warn('[SCRAPER WARNING] Possibly incomplete member list — only', members.length, 'member(s) returned');
+  }
+
+  console.log('[SCRAPER] Members found:', members.map((m) => m.name));
   console.log('[SYNC] Proceeding with sync using', members.length, 'members');
   return members;
 }

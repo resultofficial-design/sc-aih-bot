@@ -218,7 +218,7 @@ client.on(Events.MessageCreate, async (message) => {
     try {
       console.log('Running sync function...');
       const syncStart = Date.now();
-      const summary = await runSync(message.guild, membersRef, pendingDmConfirmations);
+      const summary = await runSync(message.guild, membersRef, pendingDmConfirmations, message.channel);
       const elapsedSec = ((Date.now() - syncStart) / 1000).toFixed(1);
 
       syncDone = true;

@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { scrapeOrgMembers } = require('./scraper');
 const { ensureRole, isManagedRole } = require('./roles');
-const { load, setUser, getUserByHandle } = require('./users');
+const { load, setUser, getUser, getUserByHandle } = require('./users');
 const { findBestMatchRaw, similarity } = require('./fuzzy');
 const { updateNickname } = require('./nicknames');
 const { resolveConflicts } = require('./conflicts');
@@ -81,120 +81,174 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
   return { updated, rolesAdded, rolesRemoved, unmatched };
 }
 
-async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendingDmConfirmations) {
+async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendingDmConfirmations, channel = null) {
   const autoLinked = [];
   const needsReview = [];
 
+  const clean = (str) => (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // Track Discord IDs linked during this run — one Discord user = one RSI identity
+  const linkedThisRun = new Set();
+
+  console.log('[DEBUG] RSI MEMBERS COUNT:', freshMembers.length);
+  console.log('[DEBUG] RSI MEMBERS:', freshMembers.map((m) => m.name));
   console.log('[SYNC] Using cached Discord members:', guild.members.cache.size);
 
   for (const orgMember of freshMembers) {
     const rsiName = orgMember.name;
+    const rsiClean = clean(rsiName);
 
-    // Skip if this RSI handle is already claimed — handled by processVerifiedUsers + resolveConflicts
-    if (getUserByHandle(rsiName)) continue;
+    // Skip only if already claimed by a member who is still in the guild
+    const existingId = getUserByHandle(rsiName);
+    if (existingId && guild.members.cache.has(existingId)) continue;
 
-    // Collect all unverified Discord candidates with any meaningful similarity
+    // Build candidates using STRICT two-part rule
     const candidates = [];
     guild.members.cache.forEach((member) => {
       if (member.user.bot) return;
 
-      const usernameScore = similarity(member.user.username, rsiName);
-      const nicknameScore = similarity(member.nickname || '', rsiName);
-      const bestScore = Math.max(usernameScore, nicknameScore);
+      const usernameClean = clean(member.user.username);
+      const displayClean = clean(member.displayName || '');
+      const usernameScore = similarity(usernameClean, rsiClean);
+      const displayScore = similarity(displayClean, rsiClean);
 
-      if (bestScore > 0.4) {
-        candidates.push({ discordId: member.id, discordMember: member, usernameScore, nicknameScore, bestScore });
-      }
+      console.log('[MATCH CHECK]', {
+        rsi: rsiName,
+        user: member.user.username,
+        display: member.displayName,
+        usernameScore: usernameScore.toFixed(3),
+        displayScore: displayScore.toFixed(3),
+      });
+
+      // Hard rejection: both scores too low
+      if (displayScore < 0.6 && usernameScore < 0.6) return;
+
+      // Must have string overlap AND strong score
+      const hasStringMatch = (
+        displayClean === rsiClean ||
+        usernameClean === rsiClean ||
+        (displayClean.length >= 3 && displayClean.includes(rsiClean)) ||
+        (rsiClean.length >= 3 && rsiClean.includes(displayClean))
+      );
+      const hasStrongScore = displayScore >= 0.75 || usernameScore >= 0.8;
+
+      if (!hasStringMatch || !hasStrongScore) return;
+
+      candidates.push({ discordId: member.id, discordMember: member, usernameScore, displayScore });
+      console.log('[CANDIDATE FOUND]', {
+        rsi: rsiName,
+        user: member.user.username,
+        display: member.displayName,
+        usernameScore: usernameScore.toFixed(3),
+        displayScore: displayScore.toFixed(3),
+      });
     });
 
     if (candidates.length === 0) continue;
 
-    console.log(
-      `[UNVERIFIED] RSI: ${rsiName} — ${candidates.length} candidate(s): ` +
-      candidates.map((c) => `${c.discordMember.user.tag} (${c.bestScore.toFixed(2)})`).join(', ')
-    );
+    // Sort: displayScore DESC → usernameScore DESC → join date ASC
+    const sorted = [...candidates].sort((a, b) => {
+      const displayDiff = b.displayScore - a.displayScore;
+      if (Math.abs(displayDiff) > 0.01) return displayDiff;
+      const usernameDiff = b.usernameScore - a.usernameScore;
+      if (Math.abs(usernameDiff) > 0.01) return usernameDiff;
+      return (a.discordMember.joinedTimestamp || Infinity) - (b.discordMember.joinedTimestamp || Infinity);
+    });
 
-    let winner = null;
+    const winner = sorted[0];
+    const losers = sorted.slice(1);
+    const bestScore = Math.max(winner.usernameScore, winner.displayScore);
 
-    if (candidates.length === 1) {
-      winner = candidates[0];
-    } else {
-      // Multiple candidates — resolve conflict before any assignment
-
-      // Step 1: One is already verified (edge case guard)
-      const verifiedCandidate = candidates.find((c) => verifiedUsers[c.discordId]);
-      if (verifiedCandidate) {
-        winner = verifiedCandidate;
-        console.log(`[UNVERIFIED] Conflict resolved (verified): ${winner.discordMember.user.tag} wins for RSI: ${rsiName}`);
-      }
-
-      // Step 2: Nickname exactly matches RSI name
-      if (!winner) {
-        const exactNick = candidates.find(
-          (c) => (c.discordMember.nickname || '').toLowerCase() === rsiName.toLowerCase()
-        );
-        if (exactNick) {
-          winner = exactNick;
-          console.log(`[UNVERIFIED] Conflict resolved (exact nickname): ${winner.discordMember.user.tag} wins for RSI: ${rsiName}`);
-        }
-      }
-
-      // Step 3: Earliest joinedAt (only if unambiguous)
-      if (!winner) {
-        const sorted = [...candidates].sort(
-          (a, b) => (a.discordMember.joinedTimestamp || Infinity) - (b.discordMember.joinedTimestamp || Infinity)
-        );
-        if (sorted[0].discordMember.joinedTimestamp !== sorted[1].discordMember.joinedTimestamp) {
-          winner = sorted[0];
-          console.log(`[UNVERIFIED] Conflict resolved (join date): ${winner.discordMember.user.tag} wins for RSI: ${rsiName}`);
-        }
-      }
-
-      // Step 4: No clear winner — flag for manual review
-      if (!winner) {
-        console.log(
-          `[UNVERIFIED] [CONFLICT] Manual review required for RSI: ${rsiName} — ` +
-          candidates.map((c) => c.discordMember.user.tag).join(', ')
-        );
+    // Multiple candidates: winner must be clearly stronger than runner-up
+    if (losers.length > 0) {
+      const runnerUpScore = Math.max(losers[0].usernameScore, losers[0].displayScore);
+      if (bestScore - runnerUpScore < 0.05) {
+        console.log(`[CONFLICT] Scores too close for RSI: ${rsiName} — skipping auto-link`);
+        needsReview.push({ rsiHandle: rsiName, candidates: sorted.map((c) => c.discordMember.user.tag) });
         continue;
       }
     }
 
-    if (!winner) continue;
+    // Strict auto-link threshold — applies to both single and multi-candidate
+    if (winner.displayScore < 0.8 && winner.usernameScore < 0.85) {
+      console.log(`[SKIP] Match not strong enough for RSI: ${rsiName} — displayScore: ${winner.displayScore.toFixed(2)}, usernameScore: ${winner.usernameScore.toFixed(2)}`);
+      continue;
+    }
 
-    // Enforce winner — score no longer gates assignment
+    console.log('[LINK DECISION]', {
+      chosen: winner?.discordMember?.user?.username,
+      rsi: rsiName,
+    });
+
+    // One Discord user = one RSI identity
+    const alreadyLinked = getUser(winner.discordId);
+    if (alreadyLinked && alreadyLinked.toLowerCase() !== rsiName.toLowerCase()) {
+      console.log(`[BLOCKED] ${winner.discordMember.user.tag} already linked to "${alreadyLinked}", skipping RSI: ${rsiName}`);
+      continue;
+    }
+
+    if (linkedThisRun.has(winner.discordId)) {
+      console.log(`[BLOCKED] ${winner.discordMember.user.tag} already linked this sync run, skipping RSI: ${rsiName}`);
+      continue;
+    }
+
     setUser(winner.discordId, rsiName);
+    linkedThisRun.add(winner.discordId);
     const rolesAdded = await assignRanks(guild, winner.discordMember, orgMember);
     await updateNickname(guild, winner.discordMember, rsiName);
+    console.log(`[AUTO-LINK] Verified: ${winner.discordMember.user.tag} → RSI: ${rsiName} — ${rolesAdded} role(s) assigned`);
+    autoLinked.push({
+      discordTag: winner.discordMember.user.tag,
+      rsiHandle: rsiName,
+      score: (Math.max(winner.usernameScore, winner.displayScore) * 100).toFixed(1),
+    });
 
-    console.log(`[FIX] Winner enforced: ${winner.discordMember.user.tag} → RSI: ${rsiName} (score: ${winner.bestScore.toFixed(2)}) — ${rolesAdded} role(s) assigned`);
-    autoLinked.push({ discordTag: winner.discordMember.user.tag, rsiHandle: rsiName, score: (winner.bestScore * 100).toFixed(1) });
-
-    // Handle losers immediately
-    const losers = candidates.filter((c) => c.discordId !== winner.discordId);
+    // Handle impostors
     for (const loser of losers) {
-      for (const role of loser.discordMember.roles.cache.values()) {
+      const loserMember = loser.discordMember;
+
+      for (const role of loserMember.roles.cache.values()) {
         if (isManagedRole(role.id)) {
           try {
-            await loser.discordMember.roles.remove(role);
+            await loserMember.roles.remove(role);
           } catch (err) {
-            console.warn(`[UNVERIFIED] Could not remove role "${role.name}" from ${loser.discordMember.user.tag}: ${err.message}`);
+            console.warn(`[UNVERIFIED] Could not remove role "${role.name}" from ${loserMember.user.tag}: ${err.message}`);
           }
         }
       }
+
       try {
-        await loser.discordMember.setNickname('⚠️ Unverified', 'Conflict resolution — imposter detected');
+        await loserMember.setNickname('⚠️ Unverified', 'Conflict resolution — impostor detected');
       } catch (err) {
-        console.warn(`[UNVERIFIED] Could not rename ${loser.discordMember.user.tag}: ${err.message}`);
+        console.warn(`[UNVERIFIED] Could not rename ${loserMember.user.tag}: ${err.message}`);
       }
-      console.log(`[UNVERIFIED] Loser handled: ${loser.discordMember.user.tag}`);
+
+      try {
+        const dm = await loserMember.user.createDM();
+        await dm.send(
+          `⚠️ You were linked to an RSI identity that belongs to another user.\n` +
+          `Your roles have been removed. Contact an admin if this is incorrect.`
+        );
+      } catch (e) {
+        console.warn(`[DM FAILED] Could not DM impostor: ${loserMember.user.tag}`);
+      }
+
+      if (channel) {
+        try {
+          await channel.send(`⚠️ ${loserMember} removed from incorrect RSI identity (**${rsiName}**)`);
+        } catch (e) {
+          console.warn(`[CHANNEL WARN] Could not post warning for ${loserMember.user.tag}`);
+        }
+      }
+
+      console.log(`[UNVERIFIED] Impostor handled: ${loserMember.user.tag}`);
     }
   }
 
   return { autoLinked, needsReview };
 }
 
-async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
+async function runSync(guild, cachedMembersRef, pendingDmConfirmations, channel = null) {
   console.log('[sync] Starting sync...');
 
   let freshMembers;
@@ -237,6 +291,19 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
     if (!exists) rolesCreated++;
   }
 
+  // Fetch ALL guild members so the cache is complete before any matching
+  console.log('[SYNC] Fetching all guild members...');
+  try {
+    await guild.members.fetch({ time: 60000 });
+  } catch (err) {
+    console.warn('[SYNC] Could not fetch all members:', err.message);
+  }
+  console.log('[SYNC] Total Discord members:', guild.members.cache.size);
+
+  if (guild.members.cache.size < 10) {
+    console.warn('[WARNING] Low Discord member count:', guild.members.cache.size);
+  }
+
   const verifiedUsers = load();
 
   const { updated, rolesAdded, rolesRemoved, unmatched } =
@@ -245,12 +312,12 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations) {
   // Resolve identity conflicts after verified users are processed
   const latestVerified = load();
   const { resolved: conflictsResolved, unresolved: conflictsUnresolved } =
-    await resolveConflicts(guild, freshMembers, latestVerified);
+    await resolveConflicts(guild, freshMembers, latestVerified, { assignRanks, channel });
 
   // Re-load so any in-flight auto-links are reflected
   const updatedVerified = load();
   const { autoLinked, needsReview } =
-    await processUnverifiedUsers(guild, freshMembers, updatedVerified, pendingDmConfirmations);
+    await processUnverifiedUsers(guild, freshMembers, updatedVerified, pendingDmConfirmations, channel);
 
   const summary = {
     usersUpdated: updated,
