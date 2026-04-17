@@ -110,13 +110,28 @@ async function extractMembers(page, orgName) {
 
   const extract = () => page.evaluate(() => {
     const cleanText = (str) => (str || '').replace(/\s+/g, ' ').trim();
-    // Words that appear in UI controls, not member cards
-    const INVALID_WORDS = ['search', 'reset', 'display users'];
+
+    // Known RSI org role names — used to identify the role line reliably
+    const RSI_ROLES = [
+      'employee', 'officer', 'member', 'affiliate', 'recruit',
+      'admiral', 'director', 'manager', 'founder', 'veteran',
+    ];
+
+    // Words that only appear in UI controls, never in a real member card
+    const INVALID_WORDS = ['search', 'reset', 'display users', 'filter', 'sort by'];
 
     const seen = new Set();
     const results = [];
 
-    const cards = document.querySelectorAll('[class*="member"]');
+    // Try progressively broader selectors until we find individual cards
+    // li elements are most likely to be individual items in a member list
+    let cards = document.querySelectorAll('li[class*="member"]');
+    if (cards.length === 0) {
+      cards = document.querySelectorAll('[class*="member-item"], [class*="memberItem"], [class*="member_item"]');
+    }
+    if (cards.length === 0) {
+      cards = document.querySelectorAll('[class*="member"]');
+    }
     console.log('[scraper] Card count:', cards.length);
 
     cards.forEach((card) => {
@@ -125,24 +140,35 @@ async function extractMembers(page, orgName) {
         .map((t) => cleanText(t))
         .filter(Boolean);
 
-      // Need at least: displayName, handle, role
-      if (lines.length < 3) return;
+      // Individual cards have 3–8 lines; anything more is a container element
+      if (lines.length < 3 || lines.length > 8) return;
 
       const displayName = lines[0];
       const handle = lines[1].replace(/^@/, '');
-      // Role is always the last meaningful line on the card
-      const role = lines[lines.length - 1];
 
       if (!handle || handle.length < 2 || handle.length > 60) return;
       if (seen.has(handle.toLowerCase())) return;
 
-      // Discard UI control cards masquerading as member cards
-      const isInvalid = INVALID_WORDS.some((w) => handle.toLowerCase().includes(w));
+      // Reject cards where the handle looks like UI text
+      const isInvalid = INVALID_WORDS.some(
+        (w) => handle.toLowerCase().includes(w) || displayName.toLowerCase().includes(w)
+      );
       if (isInvalid) return;
+
+      // Find the role by scanning lines from the end for a known RSI role name.
+      // This is robust against icon elements that may produce empty/junk lines.
+      let role = 'Member';
+      for (let i = lines.length - 1; i >= 2; i--) {
+        const lc = lines[i].toLowerCase();
+        if (RSI_ROLES.some((r) => lc === r || lc.startsWith(r))) {
+          role = lines[i];
+          break;
+        }
+      }
 
       seen.add(handle.toLowerCase());
 
-      // role  = single RSI role string (e.g. "Officer", "Admiral")
+      // role  = single RSI role string (e.g. "Officer", "Employee")
       // rank  = alias kept for backwards compatibility with all existing code
       // name  = handle, primary identity used for matching
       results.push({ displayName, handle, name: handle, role, rank: role });
