@@ -1,10 +1,11 @@
 const cron = require('node-cron');
 const { scrapeOrgMembers } = require('./scraper');
 const { ensureRole, isManagedRole } = require('./roles');
-const { load, setUser, getUser, getUserByHandle } = require('./users');
+const { load, setUser, getUser, getUserByHandle, removeUser } = require('./users');
 const { findBestMatchRaw, similarity } = require('./fuzzy');
 const { updateNickname } = require('./nicknames');
 const { resolveConflicts } = require('./conflicts');
+const { isLocked } = require('./locked');
 
 const AUTO_LINK_THRESHOLD = 0.85;
 const REVIEW_THRESHOLD = 0.75;
@@ -102,10 +103,33 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
     const existingId = getUserByHandle(rsiName);
     if (existingId && guild.members.cache.has(existingId)) continue;
 
-    // Build candidates using STRICT two-part rule
+    // Build candidates using STRICT two-part rule + fallback tier
     const candidates = [];
     guild.members.cache.forEach((member) => {
       if (member.user.bot) return;
+
+      console.log('[SCAN MEMBER]', { username: member.user.username, display: member.displayName });
+
+      // Skip locked users — admin has confirmed their identity
+      if (isLocked(member.id)) {
+        console.log(`[LOCKED USER - SKIPPED] ${member.user.username}`);
+        return;
+      }
+
+      // Froxie-specific detection
+      if (
+        member.user.username.toLowerCase().includes('froxie') ||
+        (member.displayName || '').toLowerCase().includes('froxie')
+      ) {
+        console.log('[FROXIE FOUND IN DISCORD]', { username: member.user.username, display: member.displayName });
+      }
+
+      // Exclude members already linked to a different RSI identity
+      const existingLink = getUser(member.id);
+      if (existingLink && existingLink.toLowerCase() !== rsiName.toLowerCase()) {
+        console.log('[SKIP REASON]', { user: member.user.username, reason: 'already linked', linkedTo: existingLink });
+        return;
+      }
 
       const usernameClean = clean(member.user.username);
       const displayClean = clean(member.displayName || '');
@@ -121,9 +145,12 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
       });
 
       // Hard rejection: both scores too low
-      if (displayScore < 0.6 && usernameScore < 0.6) return;
+      if (displayScore < 0.6 && usernameScore < 0.6) {
+        console.log(`[REJECTED - LOW MATCH] ${member.user.username} vs RSI: ${rsiName}`);
+        return;
+      }
 
-      // Must have string overlap AND strong score
+      // Strict match: string overlap AND strong score
       const hasStringMatch = (
         displayClean === rsiClean ||
         usernameClean === rsiClean ||
@@ -132,16 +159,31 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
       );
       const hasStrongScore = displayScore >= 0.75 || usernameScore >= 0.8;
 
-      if (!hasStringMatch || !hasStrongScore) return;
+      if (hasStringMatch && hasStrongScore) {
+        candidates.push({ discordId: member.id, discordMember: member, usernameScore, displayScore, isFallback: false });
+        console.log('[CANDIDATE FOUND]', {
+          rsi: rsiName,
+          user: member.user.username,
+          display: member.displayName,
+          usernameScore: usernameScore.toFixed(3),
+          displayScore: displayScore.toFixed(3),
+        });
+        console.log('[CANDIDATE ADDED]', { rsi: rsiName, user: member.user.username });
+        return;
+      }
 
-      candidates.push({ discordId: member.id, discordMember: member, usernameScore, displayScore });
-      console.log('[CANDIDATE FOUND]', {
-        rsi: rsiName,
-        user: member.user.username,
-        display: member.displayName,
-        usernameScore: usernameScore.toFixed(3),
-        displayScore: displayScore.toFixed(3),
-      });
+      // Fallback match: weaker score, no string overlap required — won't auto-link but stays in pool
+      if (displayScore >= 0.65 || usernameScore >= 0.7) {
+        candidates.push({ discordId: member.id, discordMember: member, usernameScore, displayScore, isFallback: true });
+        console.log('[FALLBACK MATCH]', {
+          rsi: rsiName,
+          user: member.user.username,
+          display: member.displayName,
+          usernameScore: usernameScore.toFixed(3),
+          displayScore: displayScore.toFixed(3),
+        });
+        console.log('[CANDIDATE ADDED]', { rsi: rsiName, user: member.user.username, fallback: true });
+      }
     });
 
     if (candidates.length === 0) continue;
@@ -171,7 +213,7 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
 
     // Strict auto-link threshold — applies to both single and multi-candidate
     if (winner.displayScore < 0.8 && winner.usernameScore < 0.85) {
-      console.log(`[SKIP] Match not strong enough for RSI: ${rsiName} — displayScore: ${winner.displayScore.toFixed(2)}, usernameScore: ${winner.usernameScore.toFixed(2)}`);
+      console.log(`[SKIP LINK - NOT STRONG ENOUGH] RSI: ${rsiName} — displayScore: ${winner.displayScore.toFixed(2)}, usernameScore: ${winner.usernameScore.toFixed(2)}`);
       continue;
     }
 
@@ -248,6 +290,98 @@ async function processUnverifiedUsers(guild, freshMembers, verifiedUsers, pendin
   return { autoLinked, needsReview };
 }
 
+async function detectSuspiciousIdentities(guild, freshMembers, verifiedUsers, channel) {
+  const clean = (str) => (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const suspicious = [];
+
+  for (const [discordId, currentRsi] of Object.entries(verifiedUsers)) {
+    const discordMember = guild.members.cache.get(discordId);
+    if (!discordMember) continue;
+
+    // Never touch locked users
+    if (isLocked(discordId)) {
+      console.log(`[LOCKED USER - SKIPPED] ${discordMember.user.tag} — suspicious detection skipped`);
+      continue;
+    }
+
+    const usernameClean = clean(discordMember.user.username);
+    const displayClean = clean(discordMember.displayName || '');
+
+    for (const orgMember of freshMembers) {
+      const otherRsi = orgMember.name;
+      if (otherRsi.toLowerCase() === currentRsi.toLowerCase()) continue;
+
+      const otherRsiClean = clean(otherRsi);
+      const usernameScore = similarity(usernameClean, otherRsiClean);
+      const displayScore = similarity(displayClean, otherRsiClean);
+      const bestScore = Math.max(usernameScore, displayScore);
+
+      if (bestScore < 0.8) continue;
+
+      console.log('[SUSPICIOUS MATCH]', {
+        user: discordMember.user.username,
+        currentRSI: currentRsi,
+        suspectedRSI: otherRsi,
+        score: bestScore.toFixed(3),
+      });
+
+      if (bestScore >= 0.9) {
+        // AUTO-CORRECT — score is very strong
+        console.log(`[AUTO-CORRECT] ${discordMember.user.tag}: "${currentRsi}" → "${otherRsi}" (score: ${bestScore.toFixed(3)})`);
+
+        removeUser(discordId);
+        setUser(discordId, otherRsi);
+
+        const orgMemberData = freshMembers.find((m) => m.name.toLowerCase() === otherRsi.toLowerCase());
+        if (orgMemberData) await assignRanks(guild, discordMember, orgMemberData);
+        await updateNickname(guild, discordMember, otherRsi);
+
+        try {
+          const dm = await discordMember.user.createDM();
+          await dm.send(
+            `✅ Your account has been automatically corrected to **${otherRsi}** because it strongly matches your Discord name.\n` +
+            `If this is incorrect, please contact an admin.`
+          );
+        } catch (e) { /* silent */ }
+
+        if (channel) {
+          try {
+            await channel.send(`⚠️ ${discordMember} was automatically corrected from **${currentRsi}** → **${otherRsi}**`);
+          } catch (e) {}
+        }
+
+        suspicious.push({ discordMember, currentRsi, suspectedRsi: otherRsi, score: bestScore, autoCorrected: true });
+      } else {
+        // 0.8–0.9 — alert only, no auto-fix
+        suspicious.push({ discordMember, currentRsi, suspectedRsi: otherRsi, score: bestScore, autoCorrected: false });
+
+        if (channel) {
+          try {
+            await channel.send(
+              `⚠️ Suspicious identity detected:\n` +
+              `User: ${discordMember}\n` +
+              `Currently linked as: **${currentRsi}**\n` +
+              `But strongly matches: **${otherRsi}**\n` +
+              `Manual review required.`
+            );
+          } catch (e) {
+            console.warn(`[SUSPICIOUS] Could not send channel alert for ${discordMember.user.tag}`);
+          }
+        }
+
+        try {
+          const dm = await discordMember.user.createDM();
+          await dm.send(`⚠️ You may be linked incorrectly. If your RSI name is **${otherRsi}**, please contact an admin.`);
+        } catch (e) { /* silent */ }
+      }
+
+      break; // One action per user
+    }
+  }
+
+  return suspicious;
+}
+
 async function runSync(guild, cachedMembersRef, pendingDmConfirmations, channel = null) {
   console.log('[sync] Starting sync...');
 
@@ -291,17 +425,27 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations, channel 
     if (!exists) rolesCreated++;
   }
 
-  // Fetch ALL guild members so the cache is complete before any matching
+  // Fetch ALL guild members — force: true bypasses cache and pulls fresh from Discord
   console.log('[SYNC] Fetching all guild members...');
+  let members;
   try {
-    await guild.members.fetch({ time: 60000 });
+    members = await guild.members.fetch({ force: true });
   } catch (err) {
-    console.warn('[SYNC] Could not fetch all members:', err.message);
+    console.error('[SYNC] Failed to fetch members:', err.message);
+    return { error: `Failed to fetch Discord members: ${err.message}`, usersUpdated: 0, rolesAdded: 0, rolesRemoved: 0, rolesCreated: 0, autoLinked: [], needsReview: [], unmatched: [], conflictsResolved: 0, conflictsUnresolved: 0, suspiciousCount: 0 };
   }
-  console.log('[SYNC] Total Discord members:', guild.members.cache.size);
 
-  if (guild.members.cache.size < 10) {
-    console.warn('[WARNING] Low Discord member count:', guild.members.cache.size);
+  if (!members || members.size === 0) {
+    throw new Error('Failed to fetch Discord members');
+  }
+
+  console.log('[SYNC] Total Discord members fetched:', members.size);
+  console.log('[MEMBERS LIST]', members.filter(m => !m.user.bot).map(m => m.user.username).join(', '));
+
+  if (members.size <= 3) {
+    console.error('[CRITICAL] Only a few members loaded — check intents or bot permissions');
+  } else if (members.size < 10) {
+    console.warn('[WARNING] Low Discord member count:', members.size);
   }
 
   const verifiedUsers = load();
@@ -319,6 +463,10 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations, channel 
   const { autoLinked, needsReview } =
     await processUnverifiedUsers(guild, freshMembers, updatedVerified, pendingDmConfirmations, channel);
 
+  // Scan verified users for suspicious identity matches
+  const finalVerified = load();
+  const suspicious = await detectSuspiciousIdentities(guild, freshMembers, finalVerified, channel);
+
   const summary = {
     usersUpdated: updated,
     rolesAdded,
@@ -329,6 +477,7 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations, channel 
     unmatched,
     conflictsResolved,
     conflictsUnresolved,
+    suspiciousCount: suspicious.length,
   };
 
   console.log(

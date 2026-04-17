@@ -2,7 +2,8 @@ console.log("=== THIS IS THE NEW BOT VERSION ===");
 const { Client, GatewayIntentBits, Events, ChannelType } = require('discord.js');
 const config = require('./config');
 const { scrapeOrgMembers } = require('./scraper');
-const { load, setUser, getUser, getUserByHandle } = require('./users');
+const { load, setUser, getUser, getUserByHandle, removeUser } = require('./users');
+const { lockUser, unlockUser, isLocked } = require('./locked');
 const { syncRoles, assignRoleToMember } = require('./roles');
 const { findBestMatchRaw } = require('./fuzzy');
 const { runSync, scheduleWeeklySync } = require('./sync');
@@ -12,6 +13,7 @@ const { unresolvedConflicts } = require('./conflicts');
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers, // REQUIRED to fetch all server members
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
@@ -210,6 +212,9 @@ client.on(Events.MessageCreate, async (message) => {
       if (summary.conflictsUnresolved > 0) {
         lines.push(`🔍 Needs review:    **${summary.conflictsUnresolved}** — use \`!conflicts\` for details`);
       }
+      if (summary.suspiciousCount > 0) {
+        lines.push(`🚨 Suspicious IDs:  **${summary.suspiciousCount}** — alerts sent above`);
+      }
 
       lines.push(footer);
       return lines.join('\n');
@@ -334,6 +339,81 @@ client.on(Events.MessageCreate, async (message) => {
       }
     }
     return message.reply(lines.join('\n'));
+  }
+
+  // !help — list all commands
+  if (cmd === '!help') {
+    return message.reply([
+      '🤖 **Bot Commands**',
+      '',
+      '🔹 `!sync` → Run full verification sync',
+      '🔹 `!verify <RSI_HANDLE>` → Link your Discord to an RSI identity',
+      '🔹 `!whoami` → Show your linked RSI handle',
+      '🔹 `!lock @user` → Lock user (prevents future changes by the system)',
+      '🔹 `!unlock @user` → Unlock user',
+      '🔹 `!force @user RSI_NAME` → Manually assign RSI identity',
+      '🔹 `!unlink @user` → Remove verification',
+      '🔹 `!conflicts` → Show unresolved identity conflicts',
+      '🔹 `!nonick` → Opt out of nickname sync',
+      '🔹 `!yesnick` → Opt back in to nickname sync',
+      '🔹 `!help` → Show this message',
+    ].join('\n'));
+  }
+
+  // !lock @user — prevent system from touching this user
+  if (cmd.startsWith('!lock ')) {
+    const mentioned = message.mentions.members?.first();
+    if (!mentioned) return message.reply('Usage: `!lock @user`');
+    lockUser(mentioned.id);
+    console.log(`[LOCK] ${message.author.tag} locked ${mentioned.user.tag}`);
+    return message.reply(`🔒 ${mentioned} has been locked. The system will not auto-change their identity.`);
+  }
+
+  // !unlock @user — re-enable system management for this user
+  if (cmd.startsWith('!unlock ')) {
+    const mentioned = message.mentions.members?.first();
+    if (!mentioned) return message.reply('Usage: `!unlock @user`');
+    unlockUser(mentioned.id);
+    console.log(`[UNLOCK] ${message.author.tag} unlocked ${mentioned.user.tag}`);
+    return message.reply(`🔓 ${mentioned} has been unlocked.`);
+  }
+
+  // !force @user RSI_NAME — admin manually assigns RSI identity
+  if (cmd.startsWith('!force ')) {
+    const mentioned = message.mentions.members?.first();
+    if (!mentioned) return message.reply('Usage: `!force @user RSI_NAME`');
+    const rsiName = content.slice('!force '.length).replace(/<@!?\d+>/g, '').trim();
+    if (!rsiName) return message.reply('Usage: `!force @user RSI_NAME`');
+
+    const orgMember = membersRef.members.find(
+      (m) => m.name.toLowerCase() === rsiName.toLowerCase()
+    );
+    if (!orgMember) return message.reply(`RSI handle \`${rsiName}\` not found in org.`);
+
+    setUser(mentioned.id, orgMember.name);
+    try {
+      const discordMember = await message.guild.members.fetch(mentioned.id);
+      const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
+      for (const rank of ranks) {
+        await assignRoleToMember(message.guild, discordMember, rank);
+      }
+      await updateNickname(message.guild, discordMember, orgMember.name);
+    } catch (err) {
+      console.error('[force] Role/nickname update failed:', err.message);
+    }
+    console.log(`[FORCE] ${message.author.tag} linked ${mentioned.user.tag} → ${orgMember.name}`);
+    return message.reply(`✅ ${mentioned} has been forcefully linked to **${orgMember.name}**.`);
+  }
+
+  // !unlink @user — remove RSI link from a user
+  if (cmd.startsWith('!unlink ')) {
+    const mentioned = message.mentions.members?.first();
+    if (!mentioned) return message.reply('Usage: `!unlink @user`');
+    const existing = getUser(mentioned.id);
+    if (!existing) return message.reply(`${mentioned} is not currently linked to any RSI identity.`);
+    removeUser(mentioned.id);
+    console.log(`[UNLINK] ${message.author.tag} unlinked ${mentioned.user.tag} from ${existing}`);
+    return message.reply(`✅ ${mentioned} has been unlinked from **${existing}**.`);
   }
 
   // !nonick — opt out of nickname sync
