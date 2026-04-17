@@ -11,13 +11,16 @@ const AUTO_LINK_THRESHOLD = 0.85;
 const REVIEW_THRESHOLD = 0.75;
 
 async function assignRanks(guild, discordMember, orgMember) {
-  const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
+  // Use role (new single-value field) with rank as legacy fallback
+  const roleStr = orgMember.role || orgMember.rank || '';
+  const roles = roleStr.split(',').map((r) => r.trim()).filter(Boolean);
   let added = 0;
 
-  for (const rank of ranks) {
-    const role = await ensureRole(guild, rank);
+  for (const roleName of roles) {
+    const role = await ensureRole(guild, roleName);
     if (!discordMember.roles.cache.has(role.id)) {
       await discordMember.roles.add(role);
+      console.log(`[ROLE SYNC]`, { user: discordMember.user.username, role: roleName });
       added++;
     }
   }

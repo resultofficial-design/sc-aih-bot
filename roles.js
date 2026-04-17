@@ -47,7 +47,7 @@ async function ensureRole(guild, roleName) {
   // Track this role as bot-managed
   managedRoleIds.add(role.id);
   saveManagedRoles(managedRoleIds);
-  console.log(`[roles] Created role: ${roleName} (ID: ${role.id})`);
+  console.log(`[ROLE CREATED] ${roleName} (ID: ${role.id})`);
   return role;
 }
 
@@ -58,17 +58,19 @@ async function syncRoles(guild, members) {
     return;
   }
 
-  const allRanks = new Set();
+  // role is the new single-value field; rank is the legacy alias — support both
+  const allRoles = new Set();
   for (const member of members) {
-    for (const rank of member.rank.split(',').map((r) => r.trim()).filter(Boolean)) {
-      allRanks.add(rank);
+    const roleStr = member.role || member.rank || '';
+    for (const r of roleStr.split(',').map((s) => s.trim()).filter(Boolean)) {
+      allRoles.add(r);
     }
   }
 
-  console.log(`[roles] Syncing ${allRanks.size} rank(s): ${[...allRanks].join(', ')}`);
+  console.log(`[roles] Syncing ${allRoles.size} role(s): ${[...allRoles].join(', ')}`);
 
-  for (const rank of allRanks) {
-    await ensureRole(guild, rank);
+  for (const roleName of allRoles) {
+    await ensureRole(guild, roleName);
   }
 }
 
@@ -76,7 +78,7 @@ async function assignRoleToMember(guild, discordMember, roleName) {
   const role = await ensureRole(guild, roleName);
   if (!discordMember.roles.cache.has(role.id)) {
     await discordMember.roles.add(role);
-    console.log(`[roles] Assigned role "${roleName}" to ${discordMember.user.tag}`);
+    console.log(`[ROLE SYNC]`, { user: discordMember.user.username, role: roleName });
   }
 }
 

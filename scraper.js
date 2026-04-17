@@ -109,8 +109,9 @@ async function extractMembers(page, orgName) {
   await page.waitForTimeout(3000);
 
   const extract = () => page.evaluate(() => {
-    const RANK_KEYWORDS = ['officer', 'member', 'affiliate', 'recruit', 'branding', 'role'];
     const cleanText = (str) => (str || '').replace(/\s+/g, ' ').trim();
+    // Words that appear in UI controls, not member cards
+    const INVALID_WORDS = ['search', 'reset', 'display users'];
 
     const seen = new Set();
     const results = [];
@@ -119,34 +120,32 @@ async function extractMembers(page, orgName) {
     console.log('[scraper] Card count:', cards.length);
 
     cards.forEach((card) => {
-      // Split card text into non-empty lines
       const lines = card.innerText
         .split('\n')
         .map((t) => cleanText(t))
         .filter(Boolean);
 
-      if (lines.length < 2) return;
+      // Need at least: displayName, handle, role
+      if (lines.length < 3) return;
 
       const displayName = lines[0];
-      // Handle may have a leading @ — strip it
       const handle = lines[1].replace(/^@/, '');
+      // Role is always the last meaningful line on the card
+      const role = lines[lines.length - 1];
 
       if (!handle || handle.length < 2 || handle.length > 60) return;
       if (seen.has(handle.toLowerCase())) return;
 
-      // Try to extract rank from remaining lines
-      let rank = 'Member';
-      for (let i = 2; i < lines.length; i++) {
-        const line = lines[i].toLowerCase();
-        if (RANK_KEYWORDS.some((k) => line.includes(k)) && lines[i].length <= 50) {
-          rank = lines[i];
-          break;
-        }
-      }
+      // Discard UI control cards masquerading as member cards
+      const isInvalid = INVALID_WORDS.some((w) => handle.toLowerCase().includes(w));
+      if (isInvalid) return;
 
       seen.add(handle.toLowerCase());
-      // name = handle for backwards compatibility with all existing code
-      results.push({ displayName, handle, name: handle, rank });
+
+      // role  = single RSI role string (e.g. "Officer", "Admiral")
+      // rank  = alias kept for backwards compatibility with all existing code
+      // name  = handle, primary identity used for matching
+      results.push({ displayName, handle, name: handle, role, rank: role });
     });
 
     if (results.length === 0) {
