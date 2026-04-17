@@ -95,72 +95,62 @@ async function extractMembers(page, orgName) {
     console.warn('[SCRAPER] Proceeding despite not confirming members page URL.');
   }
 
+  // Wait for member cards to appear
+  console.log('[scraper] Waiting for member cards...');
+  try {
+    await page.waitForSelector('[class*="member"]', { timeout: 15000 });
+    console.log('[scraper] Member cards found.');
+  } catch {
+    console.warn('[scraper] Member card selector timed out — proceeding anyway.');
+  }
+
   // Scroll to trigger lazy loading
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
   await page.waitForTimeout(3000);
 
-  // Wait until page has substantial content
-  console.log('[scraper] Waiting for page content...');
-  try {
-    await page.waitForFunction(
-      () => document.body.innerText.length > 1000,
-      { timeout: SELECTOR_TIMEOUT }
-    );
-  } catch {
-    console.warn('[scraper] Content wait timed out — proceeding anyway.');
-  }
-
   const extract = () => page.evaluate(() => {
     const RANK_KEYWORDS = ['officer', 'member', 'affiliate', 'recruit', 'branding', 'role'];
-    const cleanText = (str) => str.replace(/\s+/g, ' ').trim();
+    const cleanText = (str) => (str || '').replace(/\s+/g, ' ').trim();
+
     const seen = new Set();
     const results = [];
 
-    const pageTextLen = document.body.innerText.length;
-    console.log('[scraper] Page innerText length:', pageTextLen);
+    const cards = document.querySelectorAll('[class*="member"]');
+    console.log('[scraper] Card count:', cards.length);
 
-    // Broad sweep — every element in the DOM
-    const allEls = Array.from(document.querySelectorAll('*'));
+    cards.forEach((card) => {
+      // Split card text into non-empty lines
+      const lines = card.innerText
+        .split('\n')
+        .map((t) => cleanText(t))
+        .filter(Boolean);
 
-    for (const el of allEls) {
-      // Only consider leaf-ish elements with limited children
-      if (el.children.length > 20) continue;
+      if (lines.length < 2) return;
 
-      const handleEl = el.querySelector('[class*="handle"]');
-      const displayNameEl = el.querySelector('[class*="name"], [class*="nick"]');
-      const rankEl = el.querySelector('[class*="rank"], [class*="role"]');
+      const displayName = lines[0];
+      // Handle may have a leading @ — strip it
+      const handle = lines[1].replace(/^@/, '');
 
-      if (!rankEl) continue;
-      if (!handleEl && !displayNameEl) continue;
+      if (!handle || handle.length < 2 || handle.length > 60) return;
+      if (seen.has(handle.toLowerCase())) return;
 
-      // Extract handle (strip leading @)
-      const rawHandle = handleEl
-        ? cleanText(handleEl.textContent.split('\n')[0]).replace(/^@/, '')
-        : '';
-      // Extract display name
-      const rawDisplayName = displayNameEl
-        ? cleanText(displayNameEl.textContent.split('\n')[0])
-        : '';
-
-      // Handle is the primary identity; fall back to display name if no handle element
-      const handle = rawHandle || rawDisplayName;
-      const displayName = rawDisplayName || rawHandle;
-
-      if (!handle || seen.has(handle.toLowerCase()) || handle.length > 60) continue;
-
-      const rankParts = rankEl.textContent.split('\n').map(cleanText).filter((s) => s && s !== 'Roles');
-      const rank = rankParts.join(', ') || 'Member';
-      const hasRankKeyword = RANK_KEYWORDS.some((k) => rank.toLowerCase().includes(k));
-      if (!hasRankKeyword && rank.length > 30) continue;
+      // Try to extract rank from remaining lines
+      let rank = 'Member';
+      for (let i = 2; i < lines.length; i++) {
+        const line = lines[i].toLowerCase();
+        if (RANK_KEYWORDS.some((k) => line.includes(k)) && lines[i].length <= 50) {
+          rank = lines[i];
+          break;
+        }
+      }
 
       seen.add(handle.toLowerCase());
-
       // name = handle for backwards compatibility with all existing code
       results.push({ displayName, handle, name: handle, rank });
-    }
+    });
 
     if (results.length === 0) {
-      console.log('[scraper] Page preview:', document.body.innerText.slice(0, 500));
+      console.log('[scraper] Page preview (no results):', document.body.innerText.slice(0, 500));
     }
 
     return results;
@@ -168,28 +158,26 @@ async function extractMembers(page, orgName) {
 
   console.log('[scraper] Starting extraction...');
   let members = await extract();
-  console.log(`[scraper] Extracted members: ${members.length}`);
+  console.log('[SCRAPER] Members extracted:', members.length);
+  if (members.length > 0) console.log('[SCRAPER SAMPLE]', members.slice(0, 5));
 
   if (members.length === 0) {
-    console.warn('[scraper] No members found after extraction');
-    console.warn('[scraper] Retrying after 3s...');
+    console.warn('[scraper] No members found — retrying after 3s...');
     await page.waitForTimeout(3000);
     members = await extract();
-    console.log(`[scraper] Extracted members after retry: ${members.length}`);
+    console.log('[SCRAPER] Members extracted after retry:', members.length);
+    if (members.length > 0) console.log('[SCRAPER SAMPLE]', members.slice(0, 5));
   }
 
-  console.log('[SYNC DEBUG] Members length:', members?.length);
-
   if (!members || members.length === 0) {
-    console.warn('[SYNC] No members found after scraping');
-    throw new Error('No members found');
+    throw new Error('Scraper failed: No members found in card layout');
   }
 
   if (members.length < 2) {
     console.warn('[SCRAPER WARNING] Possibly incomplete member list — only', members.length, 'member(s) returned');
   }
 
-  console.log('[SCRAPER] Members found:', members.map((m) => m.name));
+  console.log('[SCRAPER] Members found:', members.map((m) => m.handle));
   console.log('[SYNC] Proceeding with sync using', members.length, 'members');
   return members;
 }
