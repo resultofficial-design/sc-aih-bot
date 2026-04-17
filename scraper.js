@@ -90,12 +90,8 @@ async function extractMembers(page, orgName, browser) {
   page.on('response', async (response) => {
     const url = response.url();
 
-    // Only look at endpoints that could plausibly return member data
-    const relevant =
-      url.includes('/api/') ||
-      url.includes('members') ||
-      url.includes('orgs') ||
-      url.includes('citizens');
+    // Target RSI's known member/organization API endpoints
+    const relevant = url.includes('/members') || url.includes('/organization');
     if (!relevant) return;
 
     const ct = response.headers()['content-type'] || '';
