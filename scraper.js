@@ -51,169 +51,115 @@ async function login(page) {
 
 async function extractMembers(page, orgName) {
   const membersUrl = `${RSI_HOME_URL}/orgs/${orgName}/members`;
-  const MAX_NAV_RETRIES = 3;
-  let onMembersPage = false;
 
-  for (let navAttempt = 1; navAttempt <= MAX_NAV_RETRIES; navAttempt++) {
-    console.log(`[SCRAPER] Navigation attempt ${navAttempt} to: ${membersUrl}`);
-    await page.goto(membersUrl, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(3000);
+  // ── Step 1: Load the org members page ──────────────────────────────────────
+  console.log(`[SCRAPER] Navigating to org members page: ${membersUrl}`);
+  await page.goto(membersUrl, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForTimeout(3000);
 
-    const currentUrl = page.url();
-    console.log('[SCRAPER] Current URL:', currentUrl);
-
-    if (!currentUrl.includes('/members')) {
-      console.warn(`[SCRAPER] Not on members page (attempt ${navAttempt}) — retrying...`);
-      if (navAttempt < MAX_NAV_RETRIES) {
-        await page.waitForTimeout(2000);
-        continue;
-      }
-      console.warn('[SCRAPER] Could not reach members page after all retries.');
-      break;
-    }
-
-    onMembersPage = true;
-
-    // Wait for members content to appear
-    try {
-      await page.waitForSelector('.member-list, .members, [data-members]', { timeout: 10000 });
-      console.log('[SCRAPER] Members selector found.');
-    } catch {
-      console.warn('[SCRAPER] Members selector not found — proceeding anyway.');
-    }
-
-    break;
+  const currentUrl = page.url();
+  console.log('[SCRAPER] Current URL:', currentUrl);
+  if (!currentUrl.includes('/members')) {
+    console.warn('[SCRAPER] Warning: not confirmed on /members URL — continuing anyway');
   }
 
-  // Log page content size and preview
-  const pageText = await page.evaluate(() => document.body.innerText);
-  console.log('[scraper] Page text length:', pageText.length);
-  console.log('[scraper] Page preview:', pageText.slice(0, 300));
-
-  if (!onMembersPage) {
-    console.warn('[SCRAPER] Proceeding despite not confirming members page URL.');
-  }
-
-  // Scroll slowly through the full page to trigger all lazy-loaded cards
-  console.log('[scraper] Scrolling page to load all members...');
+  // ── Step 2: Scroll to load all lazy-rendered profile links ────────────────
+  console.log('[scraper] Scrolling to load all profile links...');
   await page.evaluate(async () => {
     await new Promise((resolve) => {
-      const distance = 400;
-      const delay = 200;
       const timer = setInterval(() => {
-        window.scrollBy(0, distance);
+        window.scrollBy(0, 400);
         if (window.scrollY + window.innerHeight >= document.body.scrollHeight) {
           clearInterval(timer);
           resolve();
         }
-      }, delay);
+      }, 200);
     });
   });
   await page.waitForTimeout(2000);
 
-  const extract = () => page.evaluate(() => {
-    const cleanText = (str) => (str || '').replace(/\s+/g, ' ').trim();
+  // ── Step 3: Collect all unique /citizens/ profile URLs ─────────────────────
+  const rawLinks = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('a[href*="/citizens/"]'))
+      .map((a) => a.href)
+  );
 
-    // UI text that should never be treated as a member name
-    const UI_JUNK = [
-      'search', 'reset', 'display users', 'filter', 'sort',
-      'prev', 'next', 'load more', 'showing', 'members',
-      'employee', 'officer', 'affiliate', 'recruit', 'admiral',
-      'director', 'manager', 'founder', 'veteran',
-    ];
+  const uniqueLinks = [...new Set(rawLinks)];
+  console.log('[PROFILE LINKS FOUND]', uniqueLinks.length);
 
-    const seen = new Set();
-    const results = [];
+  if (uniqueLinks.length === 0) {
+    throw new Error('Scraper failed: no /citizens/ profile links found on org page');
+  }
 
-    // ── Step 1: log what every [class*="member"] selector finds ──────────────
-    const selectors = [
-      'li[class*="member"]',
-      '[class*="member-item"]',
-      '[class*="memberItem"]',
-      '[class*="member_item"]',
-      '[class*="org-member"]',
-      '[class*="orgMember"]',
-    ];
-    for (const sel of selectors) {
-      const n = document.querySelectorAll(sel).length;
-      if (n > 0) console.log(`[SEL HIT] ${sel} → ${n} elements`);
-    }
+  // ── Step 4: Visit each profile and extract the handle ──────────────────────
+  const results = [];
 
-    // ── Step 2: find individual cards ────────────────────────────────────────
-    // Try specific selectors in order; fall back to the generic one filtered
-    // by line count so we skip containers.
-    let cards = [];
-    for (const sel of selectors) {
-      const found = document.querySelectorAll(sel);
-      if (found.length > 0) { cards = Array.from(found); break; }
-    }
+  for (let i = 0; i < uniqueLinks.length; i++) {
+    const url = uniqueLinks[i];
+    console.log(`[PROFILE] ${i + 1}/${uniqueLinks.length} — ${url}`);
 
-    if (cards.length === 0) {
-      // Generic fallback: any [class*="member"] element with ≤ 8 text lines
-      cards = Array.from(document.querySelectorAll('[class*="member"]')).filter((el) => {
-        const lines = el.innerText.split('\n').map(t => t.trim()).filter(Boolean);
-        return lines.length >= 1 && lines.length <= 8;
+    try {
+      await page.goto(url, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
+
+      const data = await page.evaluate(() => {
+        const text = document.body.innerText;
+
+        // RSI profile pages show "Handle name" followed by the handle on the next line
+        // Try multiple patterns to be robust against minor layout changes
+        const patterns = [
+          /Handle\s+name\s*[\n:]\s*([^\n]+)/i,
+          /Handle\s*[\n:]\s*([^\n]+)/i,
+        ];
+
+        let handle = null;
+        for (const pattern of patterns) {
+          const m = text.match(pattern);
+          if (m && m[1] && m[1].trim().length >= 2) {
+            handle = m[1].trim();
+            break;
+          }
+        }
+
+        return { handle };
       });
-      console.log(`[SEL FALLBACK] filtered [class*="member"]: ${cards.length} elements`);
+
+      if (!data.handle || data.handle.length < 2) {
+        console.log('[SKIP INVALID HANDLE]', url);
+        continue;
+      }
+
+      results.push({
+        name: data.handle,
+        displayName: data.handle,
+        handle: data.handle,
+        role: 'Member',
+        rank: 'Member',
+        profileUrl: url,
+      });
+
+    } catch (err) {
+      console.warn(`[PROFILE ERROR] ${url} — ${err.message}`);
     }
 
-    console.log('[scraper] Cards to process:', cards.length);
-
-    // Log the first card's raw lines so we can verify structure
-    if (cards.length > 0) {
-      const sample = cards[0].innerText.split('\n').map(t => t.trim()).filter(Boolean);
-      console.log('[CARD SAMPLE lines]', sample);
-    }
-
-    // ── Step 3: extract name from line 0 of each card ────────────────────────
-    cards.forEach((card) => {
-      const lines = card.innerText
-        .split('\n')
-        .map((t) => cleanText(t))
-        .filter(Boolean);
-
-      if (lines.length === 0) return;
-
-      const name = lines[0];
-
-      if (!name || name.length < 2 || name.length > 60) return;
-      if (seen.has(name.toLowerCase())) return;
-      if (UI_JUNK.some((w) => name.toLowerCase().includes(w))) return;
-
-      seen.add(name.toLowerCase());
-      // role/rank default to 'Member' for now — will be re-added once names work
-      results.push({ name, displayName: name, handle: name, role: 'Member', rank: 'Member' });
-    });
-
-    console.log('[EXTRACTED NAMES]', results.map((r) => r.name));
-    return results;
-  });
-
-  console.log('[scraper] Starting extraction...');
-  let members = await extract();
-  console.log('[SCRAPER] Members extracted:', members.length);
-  if (members.length > 0) console.log('[SCRAPER SAMPLE]', members.slice(0, 5));
-
-  if (members.length === 0) {
-    console.warn('[scraper] No members found — retrying after 3s...');
-    await page.waitForTimeout(3000);
-    members = await extract();
-    console.log('[SCRAPER] Members extracted after retry:', members.length);
-    if (members.length > 0) console.log('[SCRAPER SAMPLE]', members.slice(0, 5));
+    // Rate limit — avoid hammering RSI servers
+    await new Promise((r) => setTimeout(r, 1000));
   }
 
-  if (!members || members.length === 0) {
-    throw new Error('Scraper failed: No members found in card layout');
+  console.log('[FINAL MEMBERS]', results.length);
+  console.log('[SAMPLE]', results.slice(0, 5));
+
+  if (results.length === 0) {
+    throw new Error('Scraper failed: visited profiles but extracted 0 valid handles');
   }
 
-  if (members.length < 2) {
-    console.warn('[SCRAPER WARNING] Possibly incomplete member list — only', members.length, 'member(s) returned');
+  if (results.length < uniqueLinks.length * 0.5) {
+    console.warn(`[SCRAPER WARNING] Only got ${results.length} handles from ${uniqueLinks.length} profile links`);
   }
 
-  console.log('[SCRAPER] Members found:', members.map((m) => m.name));
-  console.log('[SYNC] Proceeding with sync using', members.length, 'members');
-  return members;
+  console.log('[SCRAPER] Members found:', results.map((m) => m.handle));
+  console.log('[SYNC] Proceeding with sync using', results.length, 'members');
+  return results;
 }
 
 async function scrapeOrgMembers(orgName) {
