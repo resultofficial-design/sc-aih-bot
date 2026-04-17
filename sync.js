@@ -35,17 +35,17 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
   const unmatched = [];
 
   for (const [discordId, rsiHandle] of Object.entries(verifiedUsers)) {
-    // Try to find org member by handle (primary), then fall back to displayName
-    // (handles data stored before the handle-as-identity migration)
+    // Match by name (displayName) first — primary identity, same as old system.
+    // Also try handle as fallback in case old data stored a handle instead.
     let orgMember = freshMembers.find(
-      (m) => (m.handle || m.name).toLowerCase() === rsiHandle.toLowerCase()
+      (m) => m.name.toLowerCase() === rsiHandle.toLowerCase()
     );
     if (!orgMember) {
       orgMember = freshMembers.find(
-        (m) => (m.displayName || '').toLowerCase() === rsiHandle.toLowerCase()
+        (m) => (m.handle || '').toLowerCase() === rsiHandle.toLowerCase()
       );
       if (orgMember) {
-        console.log(`[HANDLE MIGRATION] ${discordId}: stored "${rsiHandle}" matched displayName → correct handle is "${orgMember.handle || orgMember.name}"`);
+        console.log(`[NAME MIGRATION] ${discordId}: stored "${rsiHandle}" matched handle → display name is "${orgMember.name}"`);
       }
     }
 
@@ -64,11 +64,12 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
       continue;
     }
 
-    const correctHandle = orgMember.handle || orgMember.name;
+    // correctName = org display name — primary identity (nickname target)
+    const correctName = orgMember.name;
 
     // Determine what needs updating
-    const handleMismatch = rsiHandle !== correctHandle;
-    const nicknameMismatch = discordMember.displayName !== correctHandle;
+    const handleMismatch = rsiHandle !== correctName;
+    const nicknameMismatch = discordMember.displayName !== correctName;
 
     const expectedRanks = new Set(
       orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean)
@@ -88,14 +89,14 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
 
     // Skip only when everything is already in the correct state
     if (!handleMismatch && !nicknameMismatch && !rolesMissing && !rolesExtra) {
-      console.log(`[SKIP - ALREADY CORRECT] ${discordMember.user.tag} (${correctHandle})`);
+      console.log(`[SKIP - ALREADY CORRECT] ${discordMember.user.tag} (${correctName})`);
       continue;
     }
 
     // Fix stored handle if it differs from the authoritative org handle
     if (handleMismatch) {
-      console.log(`[UPDATED HANDLE] ${discordMember.user.tag}: old="${rsiHandle}" → new="${correctHandle}"`);
-      setUser(discordId, correctHandle);
+      console.log(`[UPDATED HANDLE] ${discordMember.user.tag}: old="${rsiHandle}" → new="${correctName}"`);
+      setUser(discordId, correctName);
     }
 
     // Add missing roles
@@ -120,7 +121,7 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
 
     // Always ensure nickname matches the correct handle
     if (nicknameMismatch) {
-      await updateNickname(guild, discordMember, correctHandle);
+      await updateNickname(guild, discordMember, correctName);
     }
 
     updated++;

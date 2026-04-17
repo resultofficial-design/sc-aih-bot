@@ -140,25 +140,38 @@ async function extractMembers(page, orgName) {
         .map((t) => cleanText(t))
         .filter(Boolean);
 
-      // Individual cards have 3–8 lines; anything more is a container element
-      if (lines.length < 3 || lines.length > 8) return;
+      // Individual cards have 2–8 lines; anything more is a container element
+      if (lines.length < 2 || lines.length > 8) return;
 
+      // Line 0 is always the display name (the primary identity — same as old system)
       const displayName = lines[0];
-      const handle = lines[1].replace(/^@/, '');
 
-      if (!handle || handle.length < 2 || handle.length > 60) return;
-      if (seen.has(handle.toLowerCase())) return;
+      if (!displayName || displayName.length < 2 || displayName.length > 60) return;
+      if (seen.has(displayName.toLowerCase())) return;
 
-      // Reject cards where the handle looks like UI text
+      // Reject cards where the name looks like UI text
       const isInvalid = INVALID_WORDS.some(
-        (w) => handle.toLowerCase().includes(w) || displayName.toLowerCase().includes(w)
+        (w) => displayName.toLowerCase().includes(w)
       );
       if (isInvalid) return;
 
-      // Find the role by scanning lines from the end for a known RSI role name.
-      // This is robust against icon elements that may produce empty/junk lines.
+      // lines[1] might be the handle OR the role (when displayName === handle,
+      // some cards skip the duplicate and show the role directly on line 1).
+      // Detect which by checking if lines[1] is a known RSI role word.
+      const line1 = lines[1] || '';
+      const line1IsRole = RSI_ROLES.some(
+        (r) => line1.toLowerCase() === r || line1.toLowerCase().startsWith(r)
+      );
+
+      // Handle: use lines[1] only when it isn't a role word
+      const handle = line1IsRole
+        ? displayName                          // handle same as display name
+        : line1.replace(/^@/, '');
+
+      // Find role: scan from the end for the first line that is a known RSI role
+      const roleSearchStart = line1IsRole ? 1 : 2;
       let role = 'Member';
-      for (let i = lines.length - 1; i >= 2; i--) {
+      for (let i = lines.length - 1; i >= roleSearchStart; i--) {
         const lc = lines[i].toLowerCase();
         if (RSI_ROLES.some((r) => lc === r || lc.startsWith(r))) {
           role = lines[i];
@@ -166,12 +179,12 @@ async function extractMembers(page, orgName) {
         }
       }
 
-      seen.add(handle.toLowerCase());
+      seen.add(displayName.toLowerCase());
 
-      // role  = single RSI role string (e.g. "Officer", "Employee")
-      // rank  = alias kept for backwards compatibility with all existing code
-      // name  = handle, primary identity used for matching
-      results.push({ displayName, handle, name: handle, role, rank: role });
+      // name = displayName — primary identity for matching (same as old system)
+      // handle stored alongside for reference
+      // rank  = alias for role, keeps all existing code working
+      results.push({ displayName, handle, name: displayName, role, rank: role });
     });
 
     if (results.length === 0) {
