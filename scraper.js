@@ -49,7 +49,37 @@ async function login(page) {
   console.log('[scraper] Login complete. URL:', page.url());
 }
 
-async function extractMembers(page, orgName) {
+const CONCURRENCY = 5;
+
+// Opens a fresh page on the existing browser, fetches a profile, returns handle or null
+async function scrapeProfile(browser, url) {
+  const page = await browser.newPage();
+  try {
+    await page.goto(url, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
+
+    const handle = await page.evaluate(() => {
+      const text = document.body.innerText;
+      const patterns = [
+        /Handle\s+name\s*[\n:]\s*([^\n]+)/i,
+        /Handle\s*[\n:]\s*([^\n]+)/i,
+      ];
+      for (const pattern of patterns) {
+        const m = text.match(pattern);
+        if (m && m[1] && m[1].trim().length >= 2) return m[1].trim();
+      }
+      return null;
+    });
+
+    return handle ? { url, handle } : null;
+  } catch (err) {
+    console.warn(`[ERROR] ${url} — ${err.message}`);
+    return null;
+  } finally {
+    await page.close();
+  }
+}
+
+async function extractMembers(page, orgName, browser) {
   const membersUrl = `${RSI_HOME_URL}/orgs/${orgName}/members`;
 
   // ── Step 1: Load the org members page ──────────────────────────────────────
@@ -92,61 +122,36 @@ async function extractMembers(page, orgName) {
     throw new Error('Scraper failed: no /citizens/ profile links found on org page');
   }
 
-  // ── Step 4: Visit each profile and extract the handle ──────────────────────
+  // ── Step 4: Scrape profiles in parallel batches ────────────────────────────
   const results = [];
+  const totalBatches = Math.ceil(uniqueLinks.length / CONCURRENCY);
 
-  for (let i = 0; i < uniqueLinks.length; i++) {
-    const url = uniqueLinks[i];
-    console.log(`[PROFILE] ${i + 1}/${uniqueLinks.length} — ${url}`);
+  for (let i = 0; i < uniqueLinks.length; i += CONCURRENCY) {
+    const batch = uniqueLinks.slice(i, i + CONCURRENCY);
+    const batchNum = Math.floor(i / CONCURRENCY) + 1;
+    console.log(`[BATCH ${batchNum}/${totalBatches}] Scraping profiles ${i + 1}–${Math.min(i + CONCURRENCY, uniqueLinks.length)} of ${uniqueLinks.length}`);
 
-    try {
-      await page.goto(url, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
+    const batchResults = await Promise.all(
+      batch.map((url) => scrapeProfile(browser, url))
+    );
 
-      const data = await page.evaluate(() => {
-        const text = document.body.innerText;
-
-        // RSI profile pages show "Handle name" followed by the handle on the next line
-        // Try multiple patterns to be robust against minor layout changes
-        const patterns = [
-          /Handle\s+name\s*[\n:]\s*([^\n]+)/i,
-          /Handle\s*[\n:]\s*([^\n]+)/i,
-        ];
-
-        let handle = null;
-        for (const pattern of patterns) {
-          const m = text.match(pattern);
-          if (m && m[1] && m[1].trim().length >= 2) {
-            handle = m[1].trim();
-            break;
-          }
-        }
-
-        return { handle };
-      });
-
-      if (!data.handle || data.handle.length < 2) {
-        console.log('[SKIP INVALID HANDLE]', url);
-        continue;
+    for (const result of batchResults) {
+      if (result && result.handle && result.handle.length >= 2) {
+        results.push({
+          name: result.handle,
+          displayName: result.handle,
+          handle: result.handle,
+          role: 'Member',
+          rank: 'Member',
+          profileUrl: result.url,
+        });
       }
-
-      results.push({
-        name: data.handle,
-        displayName: data.handle,
-        handle: data.handle,
-        role: 'Member',
-        rank: 'Member',
-        profileUrl: url,
-      });
-
-    } catch (err) {
-      console.warn(`[PROFILE ERROR] ${url} — ${err.message}`);
     }
 
-    // Rate limit — avoid hammering RSI servers
-    await new Promise((r) => setTimeout(r, 1000));
+    console.log('[PROGRESS]', results.length, '/', uniqueLinks.length);
   }
 
-  console.log('[FINAL MEMBERS]', results.length);
+  console.log('[FINAL COUNT]', results.length);
   console.log('[SAMPLE]', results.slice(0, 5));
 
   if (results.length === 0) {
@@ -180,7 +185,7 @@ async function scrapeOrgMembers(orgName) {
 
     try {
       await login(page);
-      const members = await extractMembers(page, orgName);
+      const members = await extractMembers(page, orgName, browser);
       console.log(`[scraper] Found ${members.length} members.`);
       if (members && members.length > 0) {
         return members;
