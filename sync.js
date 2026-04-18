@@ -1,6 +1,6 @@
 const cron = require('node-cron');
 const { scrapeOrgMembers } = require('./scraper');
-const { ensureRole, isManagedRole, syncMemberRoles } = require('./roles');
+const { ensureRole, isManagedRole, syncMemberRoles, enforceRoleHierarchy } = require('./roles');
 const { load, setUser, getUser, getUserByHandle, removeUser } = require('./users');
 const { findBestMatchRaw, similarity } = require('./fuzzy');
 const { updateNickname } = require('./nicknames');
@@ -447,6 +447,9 @@ async function runSync(guild, cachedMembersRef, pendingDmConfirmations, channel 
   }
 
   console.log('[SYNC] Proceeding with sync using', freshMembers.length, 'members');
+
+  // Enforce base role hierarchy before syncing members
+  await enforceRoleHierarchy(guild);
 
   // Ensure all org ranks exist as Discord roles, count newly created ones
   await guild.roles.fetch();

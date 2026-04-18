@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SC-IA Bot Admin</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+  }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; font-weight: 600; color: var(--accent); }
+  #status-bar { margin-left: auto; display: flex; gap: 16px; align-items: center; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+  .dot.green { background: var(--green); }
+  .dot.red { background: var(--red); }
+  main { display: grid; grid-template-columns: 220px 1fr; gap: 0; height: calc(100vh - 49px); }
+  nav { background: var(--surface); border-right: 1px solid var(--border); padding: 16px 0; }
+  nav button { display: block; width: 100%; text-align: left; padding: 8px 20px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 13px; transition: all 0.15s; }
+  nav button:hover, nav button.active { background: rgba(88,166,255,0.1); color: var(--accent); }
+  .content { overflow-y: auto; padding: 24px; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .panel-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+  .card-title { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  .btn { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; font-size: 13px; transition: all 0.15s; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #000; font-weight: 600; }
+  .btn.primary:hover { opacity: 0.85; }
+  .btn.danger { border-color: var(--red); color: var(--red); }
+  .btn.danger:hover { background: var(--red); color: #fff; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .tag.green { background: rgba(63,185,80,0.15); color: var(--green); }
+  .tag.red { background: rgba(248,81,73,0.15); color: var(--red); }
+  .tag.blue { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .tag.gray { background: rgba(139,148,158,0.15); color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); padding: 8px 12px; font-weight: 600; letter-spacing: 0.5px; }
+  td { padding: 10px 12px; border-bottom: 1px solid rgba(48,54,61,0.5); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  input[type="text"], input[type="color"], select { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none; }
+  input[type="text"]:focus, select:focus { border-color: var(--accent); }
+  .search-row { display: flex; gap: 8px; margin-bottom: 16px; }
+  .search-row input { flex: 1; }
+  .inspect-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .field { margin-bottom: 10px; }
+  .field label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 4px; }
+  .field value { font-size: 14px; font-weight: 500; }
+  .sync-btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .progress { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 18px; }
+  .role-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .role-row:last-child { border-bottom: none; }
+  .role-name { flex: 1; font-weight: 500; }
+  .toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 16px; font-size: 13px; z-index: 999; animation: fadeIn 0.2s; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .empty { color: var(--muted); text-align: center; padding: 40px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SC-IA Bot Admin</h1>
+  <div id="status-bar">
+    <span id="bot-status"><span class="dot red"></span>Offline</span>
+    <span id="guild-name">—</span>
+    <span id="member-counts">—</span>
+  </div>
+</header>
+
+<main>
+  <nav>
+    <button class="active" data-panel="members">Member Status</button>
+    <button data-panel="inspect">User Inspect</button>
+    <button data-panel="sync">Sync Control</button>
+    <button data-panel="roles">Role Colors</button>
+  </nav>
+
+  <div class="content">
+
+    <!-- Members Panel -->
+    <div class="panel active" id="panel-members">
+      <div class="panel-title">Member Status</div>
+      <div class="search-row">
+        <input type="text" id="member-search" placeholder="Filter by handle, Discord tag, rank…">
+        <button class="btn" onclick="loadMembers()">Refresh</button>
+      </div>
+      <div class="card" style="padding:0; overflow:hidden;">
+        <table id="member-table">
+          <thead>
+            <tr>
+              <th>RSI Handle</th>
+              <th>Discord</th>
+              <th>Type</th>
+              <th>RSI Rank</th>
+              <th>Expected Roles</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="member-tbody">
+            <tr><td colspan="7" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Inspect Panel -->
+    <div class="panel" id="panel-inspect">
+      <div class="panel-title">User Inspect</div>
+      <div class="search-row">
+        <input type="text" id="inspect-query" placeholder="RSI handle or Discord tag…">
+        <button class="btn primary" onclick="inspectUser()">Search</button>
+      </div>
+      <div id="inspect-result"></div>
+    </div>
+
+    <!-- Sync Panel -->
+    <div class="panel" id="panel-sync">
+      <div class="panel-title">Sync Control</div>
+      <div class="card">
+        <div class="card-title">Actions</div>
+        <div class="sync-btn-row">
+          <button class="btn primary" onclick="triggerSync()">Sync All Members</button>
+        </div>
+        <div class="progress" id="sync-progress"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">RSI Members (cached)</div>
+        <div id="rsi-members-list" class="empty">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Role Colors Panel -->
+    <div class="panel" id="panel-roles">
+      <div class="panel-title">Role Colors</div>
+      <div class="card">
+        <div class="card-title">Color per role</div>
+        <div id="role-colors-list" class="empty">Loading…</div>
+        <div style="margin-top:12px;">
+          <button class="btn primary" onclick="saveRoleColors()">Save Colors</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<script>
+const API = '';
+let allUsers = [];
+let allRsiMembers = [];
+let roleColors = {};
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+document.querySelectorAll('nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('panel-' + btn.dataset.panel).classList.add('active');
+    if (btn.dataset.panel === 'members') loadMembers();
+    if (btn.dataset.panel === 'sync') loadRsiMembers();
+    if (btn.dataset.panel === 'roles') loadRoleColors();
+  });
+});
+
+// ── Status bar ────────────────────────────────────────────────────────────────
+async function loadStatus() {
+  try {
+    const s = await fetch(API + '/api/status').then(r => r.json());
+    const dot = s.botOnline ? '<span class="dot green"></span>' : '<span class="dot red"></span>';
+    document.getElementById('bot-status').innerHTML = dot + (s.botOnline ? 'Online' : 'Offline');
+    document.getElementById('guild-name').textContent = s.guildName;
+    document.getElementById('member-counts').textContent =
+      `RSI: ${s.rsiMemberCount} · Verified: ${s.verifiedCount}`;
+  } catch {}
+}
+loadStatus();
+setInterval(loadStatus, 10000);
+
+// ── Members table ─────────────────────────────────────────────────────────────
+async function loadMembers() {
+  try {
+    allUsers = await fetch(API + '/api/users').then(r => r.json());
+    renderMembers();
+  } catch (e) {
+    document.getElementById('member-tbody').innerHTML =
+      `<tr><td colspan="7" class="empty">Failed to load: ${e.message}</td></tr>`;
+  }
+}
+
+document.getElementById('member-search').addEventListener('input', renderMembers);
+
+function renderMembers() {
+  const q = document.getElementById('member-search').value.toLowerCase();
+  const rows = allUsers.filter(u =>
+    !q ||
+    u.rsiHandle.toLowerCase().includes(q) ||
+    u.discordTag.toLowerCase().includes(q) ||
+    u.rank.toLowerCase().includes(q) ||
+    u.orgType.toLowerCase().includes(q)
+  );
+
+  if (rows.length === 0) {
+    document.getElementById('member-tbody').innerHTML =
+      `<tr><td colspan="7" class="empty">No results</td></tr>`;
+    return;
+  }
+
+  document.getElementById('member-tbody').innerHTML = rows.map(u => `
+    <tr>
+      <td><strong>${esc(u.rsiHandle)}</strong></td>
+      <td style="color:var(--muted)">${esc(u.discordTag)}</td>
+      <td>${orgTypeBadge(u.orgType)}</td>
+      <td>${u.rank ? `<span class="tag blue">${esc(u.rank)}</span>` : '<span style="color:var(--muted)">—</span>'}</td>
+      <td style="font-size:12px;color:var(--muted)">${u.expectedRoles.join(', ') || '—'}</td>
+      <td>${u.synced ? '<span class="tag green">✔ synced</span>' : '<span class="tag red">✗ mismatch</span>'}</td>
+      <td>
+        <button class="btn" style="font-size:11px;padding:4px 8px" onclick="fixUser('${u.discordId}')">Fix</button>
+        <button class="btn danger" style="font-size:11px;padding:4px 8px;margin-left:4px" onclick="unlinkUser('${u.discordId}', '${esc(u.rsiHandle)}')">Unlink</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function orgTypeBadge(t) {
+  if (t === 'main') return '<span class="tag green">Main</span>';
+  if (t === 'affiliate') return '<span class="tag blue">Affiliate</span>';
+  return '<span class="tag gray">None</span>';
+}
+
+async function fixUser(discordId) {
+  try {
+    const r = await fetch(API + '/api/user/fix', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ discordId })
+    }).then(r => r.json());
+    toast(r.ok ? '✔ Roles fixed' : '✗ ' + r.error);
+    await loadMembers();
+  } catch (e) { toast('Error: ' + e.message); }
+}
+
+async function unlinkUser(discordId, handle) {
+  if (!confirm(`Unlink ${handle}? This removes their verification.`)) return;
+  try {
+    const r = await fetch(API + '/api/user/unlink', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ discordId })
+    }).then(r => r.json());
+    toast(r.ok ? '✔ User unlinked' : '✗ ' + r.error);
+    await loadMembers();
+  } catch (e) { toast('Error: ' + e.message); }
+}
+
+// ── User Inspect ──────────────────────────────────────────────────────────────
+async function inspectUser() {
+  const q = document.getElementById('inspect-query').value.trim().toLowerCase();
+  if (!q) return;
+  if (allUsers.length === 0) allUsers = await fetch(API + '/api/users').then(r => r.json());
+
+  const user = allUsers.find(u =>
+    u.rsiHandle.toLowerCase() === q ||
+    u.discordTag.toLowerCase().includes(q)
+  );
+
+  const el = document.getElementById('inspect-result');
+  if (!user) {
+    el.innerHTML = '<div class="card empty">No user found</div>';
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="card">
+      <div class="card-title">RSI Data</div>
+      <div class="inspect-grid">
+        <div>
+          <div class="field"><label>Handle</label><value>${esc(user.rsiHandle)}</value></div>
+          <div class="field"><label>Org Type</label><value>${user.orgType}</value></div>
+          <div class="field"><label>Rank</label><value>${user.rank || '—'}</value></div>
+        </div>
+        <div>
+          <div class="field"><label>Discord</label><value>${esc(user.discordTag)}</value></div>
+          <div class="field"><label>Current Roles</label><value>${user.currentRoles.join(', ') || '—'}</value></div>
+          <div class="field"><label>Expected Roles</label><value>${user.expectedRoles.join(', ') || '—'}</value></div>
+        </div>
+      </div>
+      <div style="margin-top:8px">
+        Status: ${user.synced
+          ? '<span class="tag green">✔ Synced</span>'
+          : '<span class="tag red">✗ Mismatch — roles need fixing</span>'}
+      </div>
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <button class="btn primary" onclick="fixUser('${user.discordId}')">Fix Roles</button>
+        <button class="btn danger" onclick="unlinkUser('${user.discordId}', '${esc(user.rsiHandle)}')">Unlink</button>
+      </div>
+    </div>
+  `;
+}
+
+document.getElementById('inspect-query').addEventListener('keydown', e => {
+  if (e.key === 'Enter') inspectUser();
+});
+
+// ── Sync Control ──────────────────────────────────────────────────────────────
+async function triggerSync() {
+  const btn = event.target;
+  btn.disabled = true;
+  document.getElementById('sync-progress').textContent = 'Starting sync…';
+  try {
+    const r = await fetch(API + '/api/sync', { method: 'POST' }).then(r => r.json());
+    document.getElementById('sync-progress').textContent =
+      r.ok ? '✔ Sync running in background — check bot logs for progress' : '✗ ' + r.error;
+  } catch (e) {
+    document.getElementById('sync-progress').textContent = 'Error: ' + e.message;
+  }
+  setTimeout(() => { btn.disabled = false; }, 3000);
+}
+
+async function loadRsiMembers() {
+  try {
+    allRsiMembers = await fetch(API + '/api/members').then(r => r.json());
+    const el = document.getElementById('rsi-members-list');
+    if (!allRsiMembers.length) { el.textContent = 'No members cached yet.'; return; }
+    el.innerHTML = `
+      <table>
+        <thead><tr><th>Handle</th><th>Type</th><th>Rank</th></tr></thead>
+        <tbody>
+          ${allRsiMembers.map(m => `
+            <tr>
+              <td>${esc(m.handle || m.name)}</td>
+              <td>${orgTypeBadge(m.orgType)}</td>
+              <td>${m.rank ? `<span class="tag blue">${esc(m.rank)}</span>` : '<span style="color:var(--muted)">—</span>'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+  } catch (e) {
+    document.getElementById('rsi-members-list').textContent = 'Failed: ' + e.message;
+  }
+}
+
+// ── Role Colors ───────────────────────────────────────────────────────────────
+async function loadRoleColors() {
+  try {
+    if (allRsiMembers.length === 0) {
+      allRsiMembers = await fetch(API + '/api/members').then(r => r.json());
+    }
+    roleColors = await fetch(API + '/api/role-colors').then(r => r.json());
+
+    const ranks = new Set();
+    allRsiMembers.forEach(m => { if (m.rank) ranks.add(m.rank); });
+    ['Main Member', 'Affiliate'].forEach(r => ranks.add(r));
+
+    const el = document.getElementById('role-colors-list');
+    if (!ranks.size) { el.textContent = 'No roles found.'; return; }
+
+    el.innerHTML = [...ranks].map(rank => `
+      <div class="role-row">
+        <span class="role-name">${esc(rank)}</span>
+        <input type="color" id="color-${esc(rank)}" value="${roleColors[rank] || '#99aab5'}">
+        <span style="font-size:11px;color:var(--muted)" id="preview-${esc(rank)}">${roleColors[rank] || '#99aab5'}</span>
+      </div>
+    `).join('');
+
+    ranks.forEach(rank => {
+      const input = document.getElementById('color-' + rank);
+      if (input) {
+        input.addEventListener('input', e => {
+          const preview = document.getElementById('preview-' + rank);
+          if (preview) preview.textContent = e.target.value;
+        });
+      }
+    });
+  } catch (e) {
+    document.getElementById('role-colors-list').textContent = 'Failed: ' + e.message;
+  }
+}
+
+async function saveRoleColors() {
+  const inputs = document.querySelectorAll('#role-colors-list input[type="color"]');
+  const colors = {};
+  inputs.forEach(input => {
+    const rank = input.id.replace('color-', '');
+    colors[rank] = input.value;
+  });
+  try {
+    await fetch(API + '/api/role-colors', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(colors)
+    });
+    toast('✔ Colors saved');
+  } catch (e) { toast('Error: ' + e.message); }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function esc(str) {
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+let toastTimer;
+function toast(msg) {
+  clearTimeout(toastTimer);
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  toastTimer = setTimeout(() => el.remove(), 3000);
+}
+
+// Load initial data
+loadMembers();
+</script>
+</body>
+</html>

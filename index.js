@@ -7,15 +7,20 @@ const {
   ButtonBuilder,
   ActionRowBuilder,
   ButtonStyle,
+  EmbedBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 const config = require('./config');
 const { scrapeOrgMembers } = require('./scraper');
 const { load, setUser, getUser, getUserByHandle, removeUser } = require('./users');
 const { lockUser, unlockUser, isLocked } = require('./locked');
 const { blockUser, unblockUser, isBlocked, incrementAttempts } = require('./blocked');
-const { syncRoles, assignRoleToMember, syncMemberRoles, cleanupLegacyMemberRole } = require('./roles');
+const { syncRoles, assignRoleToMember, syncMemberRoles, cleanupLegacyMemberRole, loadRoleColors, saveRoleColors, applyAllRoleColors, enforceRoleHierarchy } = require('./roles');
 const { findBestMatchRaw, similarity } = require('./fuzzy');
 const { runSync, scheduleWeeklySync } = require('./sync');
+const { startDashboard } = require('./server');
 const { updateNickname, addOptOut, removeOptOut } = require('./nicknames');
 const { unresolvedConflicts } = require('./conflicts');
 
@@ -324,9 +329,11 @@ client.once(Events.ClientReady, async (readyClient) => {
     await guild.roles.fetch();
     await guild.members.fetch();
     await cleanupLegacyMemberRole(guild);
+    await enforceRoleHierarchy(guild);
     await syncRoles(guild, membersRef.members);
 
     scheduleWeeklySync(guild, membersRef, pendingDmConfirmations);
+    startDashboard(client, membersRef, runSync);
 
     // Run self-healing sync on startup
     await syncMembers(guild);
@@ -552,10 +559,206 @@ async function completeVerificationFromButton(interaction, handle) {
 }
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isButton()) return;
-
   const { customId } = interaction;
   const userId = interaction.user.id;
+
+  // ── Admin panel: modal submission ─────────────────────────────────────────
+  if (interaction.isModalSubmit() && customId === 'admin_color_modal') {
+    const roleName = interaction.fields.getTextInputValue('color_role').trim();
+    const hex = interaction.fields.getTextInputValue('color_hex').trim();
+    if (!/^#[0-9a-fA-F]{3,6}$/.test(hex)) {
+      return interaction.reply({ content: '✗ Invalid hex color. Use format `#RRGGBB` e.g. `#3498db`', ephemeral: true });
+    }
+    const colors = loadRoleColors();
+    colors[roleName] = hex;
+    saveRoleColors(colors);
+    // Apply immediately to the Discord role if it exists
+    const role = interaction.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+    if (role) await role.setColor(parseInt(hex.replace('#', ''), 16)).catch(() => {});
+    return interaction.reply({
+      content: `✔ Color for **${roleName}** set to \`${hex}\`${role ? ' and applied to Discord.' : ' (role not in Discord yet — will apply on next sync).'}`,
+      ephemeral: true,
+    });
+  }
+
+  if (interaction.isModalSubmit() && customId === 'admin_inspect_modal') {
+    const query = interaction.fields.getTextInputValue('inspect_handle').trim().toLowerCase();
+    const verifiedUsers = load();
+    const rsiMembers = membersRef.members;
+
+    const entry = Object.entries(verifiedUsers).find(([, h]) => h.toLowerCase() === query);
+    const orgMember = rsiMembers.find(m => (m.handle || m.name).toLowerCase() === query);
+
+    if (!entry && !orgMember) {
+      return interaction.reply({ content: `No user found for \`${query}\``, ephemeral: true });
+    }
+
+    const [discordId, rsiHandle] = entry || [null, query];
+    const discordMember = discordId ? await interaction.guild.members.fetch(discordId).catch(() => null) : null;
+    const expectedRoles = orgMember ? [
+      orgMember.orgType === 'affiliate' ? 'Affiliate' : 'Main Member',
+      ...(orgMember.roles || []),
+    ] : [];
+    const currentRoles = discordMember
+      ? [...discordMember.roles.cache.values()].map(r => r.name).filter(n => n !== '@everyone')
+      : [];
+    const synced = expectedRoles.length > 0 && expectedRoles.every(r => currentRoles.includes(r));
+
+    const embed = new EmbedBuilder()
+      .setTitle(`User: ${rsiHandle || query}`)
+      .setColor(synced ? 0x3fb950 : 0xf85149)
+      .addFields(
+        { name: 'RSI Handle', value: rsiHandle || '—', inline: true },
+        { name: 'Org Type', value: orgMember?.orgType || '—', inline: true },
+        { name: 'RSI Rank', value: orgMember?.rank || '—', inline: true },
+        { name: 'Discord', value: discordMember?.user?.tag || '—', inline: true },
+        { name: 'Expected Roles', value: expectedRoles.join(', ') || '—', inline: true },
+        { name: 'Current Roles', value: currentRoles.join(', ') || '—', inline: true },
+        { name: 'Status', value: synced ? '✔ Synced' : '✗ Mismatch', inline: true },
+      );
+
+    const row = discordId ? new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`admin_fix_${discordId}`).setLabel('Fix Roles').setStyle(ButtonStyle.Primary),
+    ) : null;
+
+    return interaction.reply({ embeds: [embed], components: row ? [row] : [], ephemeral: true });
+  }
+
+  if (!interaction.isButton()) return;
+
+  // ── Admin panel buttons ───────────────────────────────────────────────────
+  if (customId === 'admin_sync') {
+    await interaction.deferReply({ ephemeral: true });
+    if (isSyncing) return interaction.editReply('⏳ Sync already running.');
+    isSyncing = true;
+    try {
+      const summary = await runSync(interaction.guild, membersRef, pendingDmConfirmations, null);
+      const msg = summary.error
+        ? `❌ Sync failed: ${summary.error}`
+        : `✅ Sync complete — ${summary.usersUpdated} updated, ${summary.rolesAdded} roles added, ${summary.autoLinked.length} auto-linked`;
+      return interaction.editReply(msg);
+    } catch (err) {
+      return interaction.editReply(`❌ ${err.message}`);
+    } finally {
+      isSyncing = false;
+    }
+  }
+
+  if (customId === 'admin_members') {
+    await interaction.deferReply({ ephemeral: true });
+    const verifiedUsers = load();
+    const rsiMembers = membersRef.members;
+    const rows = Object.entries(verifiedUsers).slice(0, 20).map(([discordId, handle]) => {
+      const m = rsiMembers.find(m => (m.handle || m.name).toLowerCase() === handle.toLowerCase());
+      const status = m ? '✔' : '✗';
+      const rank = m?.rank || '—';
+      const type = m ? (m.orgType === 'affiliate' ? 'Aff' : 'Main') : '—';
+      return `${status} \`${handle}\` — ${type} — ${rank}`;
+    });
+    const total = Object.keys(verifiedUsers).length;
+    const embed = new EmbedBuilder()
+      .setTitle(`Member Status (${Math.min(total, 20)} of ${total})`)
+      .setColor(0x58a6ff)
+      .setDescription(rows.join('\n') || 'No verified users.');
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  if (customId === 'admin_inspect') {
+    const modal = new ModalBuilder()
+      .setCustomId('admin_inspect_modal')
+      .setTitle('Inspect User');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('inspect_handle')
+          .setLabel('RSI Handle')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Mrpiggy3')
+          .setRequired(true)
+      )
+    );
+    return interaction.showModal(modal);
+  }
+
+  // ── Role Colors panel ─────────────────────────────────────────────────────
+  if (customId === 'admin_colors') {
+    const colors = loadRoleColors();
+    const lines = Object.entries(colors).map(([name, hex]) =>
+      `\`${name.padEnd(16)}\`  ${hex}`
+    );
+    const embed = new EmbedBuilder()
+      .setTitle('Role Colors')
+      .setColor(0x58a6ff)
+      .setDescription(lines.join('\n') || 'No colors configured.')
+      .setFooter({ text: 'Use "Edit Color" to change a role. Colors apply instantly.' });
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('admin_color_edit').setLabel('Edit Color').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('admin_color_apply').setLabel('Apply All Now').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('admin_color_reset').setLabel('Reset Defaults').setStyle(ButtonStyle.Danger),
+    );
+    return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+  }
+
+  if (customId === 'admin_color_edit') {
+    const modal = new ModalBuilder()
+      .setCustomId('admin_color_modal')
+      .setTitle('Edit Role Color');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('color_role')
+          .setLabel('Role Name (exact)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. Officer')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('color_hex')
+          .setLabel('Hex Color')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('#3498db')
+          .setMinLength(4)
+          .setMaxLength(7)
+          .setRequired(true)
+      ),
+    );
+    return interaction.showModal(modal);
+  }
+
+  if (customId === 'admin_color_apply') {
+    await interaction.deferReply({ ephemeral: true });
+    const updated = await applyAllRoleColors(interaction.guild);
+    return interaction.editReply(`✔ Applied colors to ${updated} Discord role(s).`);
+  }
+
+  if (customId === 'admin_color_reset') {
+    await interaction.deferReply({ ephemeral: true });
+    const defaults = {
+      'Main Member': '#95a5a6',
+      'Affiliate': '#95a5a6',
+      'Officer': '#3498db',
+      'Recruitment': '#e67e22',
+      'Branding': '#9b59b6',
+    };
+    saveRoleColors(defaults);
+    await applyAllRoleColors(interaction.guild);
+    return interaction.editReply('✔ Colors reset to defaults and applied.');
+  }
+
+  if (customId.startsWith('admin_fix_')) {
+    const discordId = customId.slice('admin_fix_'.length);
+    await interaction.deferReply({ ephemeral: true });
+    const handle = load()[discordId];
+    const orgMember = handle ? membersRef.members.find(m =>
+      (m.handle || m.name).toLowerCase() === handle.toLowerCase()
+    ) : null;
+    if (!handle || !orgMember) return interaction.editReply('User or RSI member not found.');
+    const member = await interaction.guild.members.fetch(discordId).catch(() => null);
+    if (!member) return interaction.editReply('Discord member not found.');
+    await syncMemberRoles(interaction.guild, member, { orgType: orgMember.orgType || 'main', roles: orgMember.roles || [] });
+    return interaction.editReply(`✔ Roles fixed for \`${handle}\``);
+  }
 
   // ── Auto-match: user confirmed they are the matched RSI member ────────────
   if (customId.startsWith('verify_yes_')) {
@@ -912,12 +1115,47 @@ client.on(Events.MessageCreate, async (message) => {
     return message.reply(lines.join('\n'));
   }
 
+  // !admin — Discord-native admin panel
+  if (cmd === '!admin') {
+    if (isDM) return message.reply('Use `!admin` in a server channel.');
+    const verifiedUsers = load();
+    const rsiMembers = membersRef.members;
+    const synced = Object.entries(verifiedUsers).filter(([id, handle]) => {
+      const m = rsiMembers.find(m => (m.handle || m.name).toLowerCase() === handle.toLowerCase());
+      return !!m;
+    }).length;
+    const mismatched = Object.keys(verifiedUsers).length - synced;
+
+    const embed = new EmbedBuilder()
+      .setTitle('SC-IA Admin Panel')
+      .setColor(0x58a6ff)
+      .addFields(
+        { name: 'RSI Members', value: String(rsiMembers.length), inline: true },
+        { name: 'Verified Users', value: String(Object.keys(verifiedUsers).length), inline: true },
+        { name: 'Org Matched', value: `${synced} ✔  ${mismatched > 0 ? `${mismatched} ✗` : ''}`, inline: true },
+      )
+      .setFooter({ text: 'SC-IA Bot Admin' })
+      .setTimestamp();
+
+    const row1 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('admin_sync').setLabel('Sync All').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('admin_members').setLabel('Member Status').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('admin_inspect').setLabel('Inspect User').setStyle(ButtonStyle.Secondary),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('admin_colors').setLabel('Role Colors').setStyle(ButtonStyle.Secondary),
+    );
+
+    return message.reply({ embeds: [embed], components: [row1, row2] });
+  }
+
   // !help — list all commands
   if (cmd === '!help') {
     return message.reply([
       '🤖 **Bot Commands**',
       '',
       '🔹 `!sync` → Run full verification sync',
+      '🔹 `!admin` → Open admin panel (sync, inspect users, member status)',
       '🔹 `!verify <RSI_HANDLE>` → Link your Discord to an RSI identity',
       '🔹 `!whoami` → Show your linked RSI handle',
       '🔹 `!lock @user` → Lock user (prevents future changes by the system)',

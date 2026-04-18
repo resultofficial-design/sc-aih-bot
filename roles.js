@@ -1,16 +1,32 @@
 const fs = require('fs');
-
-const ROLE_COLORS = {
-  Officer: 0x3498db,
-  Affiliate: 0x95a5a6,
-  Recruitment: 0xe67e22,
-  Branding: 0x9b59b6,
-};
+const path = require('path');
 
 const DEFAULT_COLOR = 0x99aab5;
-
 const PROTECTED_ROLES = ['Admin', 'Moderator', 'Owner'];
+const BASE_ROLES = ['Main Member', 'Affiliate', 'Non-Org'];
 const MANAGED_ROLES_FILE = './roles.json';
+const ROLE_COLORS_FILE = path.join(__dirname, 'role-colors.json');
+
+function hexToInt(hex) {
+  return parseInt((hex || '').replace('#', ''), 16) || DEFAULT_COLOR;
+}
+
+function loadRoleColors() {
+  try {
+    return JSON.parse(fs.readFileSync(ROLE_COLORS_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveRoleColors(colors) {
+  fs.writeFileSync(ROLE_COLORS_FILE, JSON.stringify(colors, null, 2));
+}
+
+function getRoleColor(roleName) {
+  const colors = loadRoleColors();
+  return colors[roleName] ? hexToInt(colors[roleName]) : DEFAULT_COLOR;
+}
 
 // Load persisted set of bot-managed role IDs
 function loadManagedRoles() {
@@ -37,19 +53,41 @@ async function ensureRole(guild, roleName) {
   const existing = guild.roles.cache.find(
     (r) => r.name.toLowerCase() === roleName.toLowerCase()
   );
-  if (existing) return existing;
+  const color = getRoleColor(roleName);
+
+  if (existing) {
+    // Update color if it differs from saved config
+    if (existing.color !== color) {
+      await existing.setColor(color).catch(() => {});
+    }
+    managedRoleIds.add(existing.id);
+    return existing;
+  }
 
   const role = await guild.roles.create({
     name: roleName,
-    color: ROLE_COLORS[roleName] ?? DEFAULT_COLOR,
+    color,
     reason: 'Auto-created by RSI role sync',
   });
 
-  // Track this role as bot-managed
   managedRoleIds.add(role.id);
   saveManagedRoles(managedRoleIds);
   console.log(`[ROLE CREATED] ${roleName} (ID: ${role.id})`);
   return role;
+}
+
+// Apply saved colors to all existing Discord roles immediately
+async function applyAllRoleColors(guild) {
+  const colors = loadRoleColors();
+  let updated = 0;
+  for (const [roleName, hex] of Object.entries(colors)) {
+    const role = guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+    if (role) {
+      await role.setColor(hexToInt(hex)).catch(() => {});
+      updated++;
+    }
+  }
+  return updated;
 }
 
 async function syncRoles(guild, members) {
@@ -81,8 +119,7 @@ async function assignRoleToMember(guild, discordMember, roleName) {
   }
 }
 
-// Full role sync: assigns org-type role (Main Member/Affiliate) + all RSI roles,
-// then removes stale managed roles that no longer belong to the member.
+// Full role sync: enforces exactly one base role + RSI rank roles, removes stale.
 async function syncMemberRoles(guild, discordMember, userData) {
   const canManage = guild.members.me?.permissions.has('ManageRoles');
   if (!canManage) {
@@ -92,16 +129,21 @@ async function syncMemberRoles(guild, discordMember, userData) {
 
   const { orgType = 'main', roles: rawRoles = [] } = userData;
   const rsiRoles = rawRoles.filter(r => r.toLowerCase() !== 'member');
-  const currentRoleIds = new Set(discordMember.roles.cache.keys());
 
-  const mainRole = await ensureRole(guild, 'Main Member');
+  // Ensure all base roles exist and collect their IDs
+  const mainRole     = await ensureRole(guild, 'Main Member');
   const affiliateRole = await ensureRole(guild, 'Affiliate');
-  const orgTypeIds = new Set([mainRole.id, affiliateRole.id]);
+  const nonOrgRole   = await ensureRole(guild, 'Non-Org');
+  const baseRoleIds  = new Set([mainRole.id, affiliateRole.id, nonOrgRole.id]);
 
-  // Build the complete set of role IDs this member should have
-  const targetRoleIds = new Set();
-  targetRoleIds.add(orgType === 'affiliate' ? affiliateRole.id : mainRole.id);
+  // Exactly one base role based on orgType
+  const targetBaseId =
+    orgType === 'affiliate' ? affiliateRole.id :
+    orgType === 'none'      ? nonOrgRole.id    :
+                              mainRole.id;
 
+  // Build full target set: one base role + rank roles
+  const targetRoleIds = new Set([targetBaseId]);
   for (const roleName of rsiRoles) {
     const role = await ensureRole(guild, roleName);
     targetRoleIds.add(role.id);
@@ -110,7 +152,23 @@ async function syncMemberRoles(guild, discordMember, userData) {
   let added = 0;
   let removed = 0;
 
+  // Remove ALL base roles first, then add the correct one (prevents duplicates)
+  for (const role of discordMember.roles.cache.values()) {
+    if (role.name === '@everyone') continue;
+    if (PROTECTED_ROLES.includes(role.name)) continue;
+    if (role.managed) continue;
+    const isBase = baseRoleIds.has(role.id);
+    const isManaged = isManagedRole(role.id);
+    if (!isBase && !isManaged) continue;
+    if (!targetRoleIds.has(role.id)) {
+      await discordMember.roles.remove(role);
+      console.log(`[ROLE SYNC] Removed "${role.name}" from ${discordMember.user.username}`);
+      removed++;
+    }
+  }
+
   // Add missing roles
+  const currentRoleIds = new Set(discordMember.roles.cache.keys());
   for (const roleId of targetRoleIds) {
     if (!currentRoleIds.has(roleId)) {
       const role = guild.roles.cache.get(roleId);
@@ -120,20 +178,33 @@ async function syncMemberRoles(guild, discordMember, userData) {
     }
   }
 
-  // Remove stale managed roles (bot-tracked or org-type roles no longer applicable)
-  for (const role of discordMember.roles.cache.values()) {
-    if (role.name === '@everyone') continue;
-    if (PROTECTED_ROLES.includes(role.name)) continue;
-    if (role.managed) continue; // integration/bot roles — never touch
-    if (!isManagedRole(role.id) && !orgTypeIds.has(role.id)) continue;
-    if (!targetRoleIds.has(role.id)) {
-      await discordMember.roles.remove(role);
-      console.log(`[ROLE SYNC] Removed stale "${role.name}" from ${discordMember.user.username}`);
-      removed++;
-    }
+  return { added, removed };
+}
+
+// Enforce strict role hierarchy: Main Member > Affiliate > Non-Org > rank roles
+async function enforceRoleHierarchy(guild) {
+  await guild.roles.fetch();
+
+  // Ensure all base roles exist
+  for (const name of BASE_ROLES) await ensureRole(guild, name);
+  await guild.roles.fetch();
+
+  const botMaxPosition = guild.members.me?.roles.highest.position ?? 0;
+  const baseStart = Math.max(1, botMaxPosition - BASE_ROLES.length);
+
+  const positions = [];
+  BASE_ROLES.forEach((name, idx) => {
+    const role = guild.roles.cache.find(r => r.name === name);
+    if (role) positions.push({ role, position: baseStart + (BASE_ROLES.length - 1 - idx) });
+  });
+
+  if (positions.length > 0) {
+    await guild.roles.setPositions(positions).catch(err =>
+      console.warn('[HIERARCHY] Could not set positions:', err.message)
+    );
   }
 
-  return { added, removed };
+  console.log('[ROLE ORDER FIXED]', BASE_ROLES);
 }
 
 // One-time startup cleanup: strips "Member" role from all users and deletes it from the server
@@ -163,4 +234,4 @@ async function cleanupLegacyMemberRole(guild) {
   }
 }
 
-module.exports = { syncRoles, ensureRole, assignRoleToMember, syncMemberRoles, cleanupLegacyMemberRole, isManagedRole };
+module.exports = { syncRoles, ensureRole, assignRoleToMember, syncMemberRoles, cleanupLegacyMemberRole, isManagedRole, loadRoleColors, saveRoleColors, applyAllRoleColors, enforceRoleHierarchy };
