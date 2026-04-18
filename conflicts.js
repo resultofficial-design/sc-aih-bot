@@ -12,7 +12,7 @@ function hasCorrectRole(discordMember, rsiName, freshMembers, guild) {
     (m) => m.name.toLowerCase() === rsiName.toLowerCase()
   );
   if (!orgMember) return false;
-  const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
+  const ranks = orgMember.roles || [];
   return ranks.some((rankName) => {
     const role = guild.roles.cache.find((r) => r.name === rankName);
     return role && discordMember.roles.cache.has(role.id);

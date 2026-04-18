@@ -1,6 +1,6 @@
 const cron = require('node-cron');
 const { scrapeOrgMembers } = require('./scraper');
-const { ensureRole, isManagedRole } = require('./roles');
+const { ensureRole, isManagedRole, syncMemberRoles } = require('./roles');
 const { load, setUser, getUser, getUserByHandle, removeUser } = require('./users');
 const { findBestMatchRaw, similarity } = require('./fuzzy');
 const { updateNickname } = require('./nicknames');
@@ -11,20 +11,11 @@ const AUTO_LINK_THRESHOLD = 0.85;
 const REVIEW_THRESHOLD = 0.75;
 
 async function assignRanks(guild, discordMember, orgMember) {
-  // Use role (new single-value field) with rank as legacy fallback
-  const roleStr = orgMember.role || orgMember.rank || '';
-  const roles = roleStr.split(',').map((r) => r.trim()).filter(Boolean);
-  let added = 0;
-
-  for (const roleName of roles) {
-    const role = await ensureRole(guild, roleName);
-    if (!discordMember.roles.cache.has(role.id)) {
-      await discordMember.roles.add(role);
-      console.log(`[ROLE SYNC]`, { user: discordMember.user.username, role: roleName });
-      added++;
-    }
-  }
-
+  const userData = {
+    orgType: orgMember.orgType || 'main',
+    roles: orgMember.roles || [],
+  };
+  const { added } = await syncMemberRoles(guild, discordMember, userData);
   return added;
 }
 
@@ -71,15 +62,18 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
     const handleMismatch = rsiHandle !== correctName;
     const nicknameMismatch = discordMember.displayName !== correctName;
 
-    const expectedRanks = new Set(
-      orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean)
-    );
+    const userData = {
+      orgType: orgMember.orgType || 'main',
+      roles: orgMember.roles || [],
+    };
+    const orgTypeRoleName = userData.orgType === 'affiliate' ? 'Affiliate' : 'Main Member';
+    const expectedRanks = new Set([orgTypeRoleName, ...userData.roles]);
 
     let rolesMissing = false;
     let rolesExtra = false;
     for (const rank of expectedRanks) {
       const role = guild.roles.cache.find((r) => r.name === rank);
-      if (role && !discordMember.roles.cache.has(role.id)) { rolesMissing = true; break; }
+      if (!role || !discordMember.roles.cache.has(role.id)) { rolesMissing = true; break; }
     }
     if (!rolesMissing) {
       for (const role of discordMember.roles.cache.values()) {
@@ -99,24 +93,11 @@ async function processVerifiedUsers(guild, freshMembers, verifiedUsers) {
       setUser(discordId, correctName);
     }
 
-    // Add missing roles
-    for (const rank of expectedRanks) {
-      const role = guild.roles.cache.find((r) => r.name === rank);
-      if (role && !discordMember.roles.cache.has(role.id)) {
-        await discordMember.roles.add(role);
-        console.log(`[sync] Added role "${rank}" to ${discordMember.user.tag}`);
-        rolesAdded++;
-      }
-    }
-
-    // Remove stale managed roles
-    for (const role of discordMember.roles.cache.values()) {
-      if (isManagedRole(role.id) && !expectedRanks.has(role.name)) {
-        console.log(`[sync] Removing stale role "${role.name}" from ${discordMember.user.tag}`);
-        await discordMember.roles.remove(role);
-        console.log(`[sync] Removed role "${role.name}" from ${discordMember.user.tag}`);
-        rolesRemoved++;
-      }
+    // Full role sync — assigns org-type + RSI roles, removes stale
+    if (rolesMissing || rolesExtra) {
+      const { added, removed } = await syncMemberRoles(guild, discordMember, userData);
+      rolesAdded += added;
+      rolesRemoved += removed;
     }
 
     // Always ensure nickname matches the correct handle

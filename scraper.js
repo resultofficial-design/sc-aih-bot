@@ -79,6 +79,7 @@ async function scrapeProfile(browser, url) {
   }
 }
 
+
 async function extractMembers(page, orgName, browser) {
   const membersUrl = `${RSI_HOME_URL}/orgs/${orgName}/members`;
 
@@ -133,7 +134,11 @@ async function extractMembers(page, orgName, browser) {
           if (text && text !== displayName && text !== handle) role = text;
         }
 
-        allMembers.push({ displayName, handle, role });
+        const isAffiliate = role.toLowerCase().includes('affiliate');
+        const orgType = isAffiliate ? 'affiliate' : 'main';
+
+        // roles populated later via profile page scraping
+        allMembers.push({ displayName, handle, orgType, roles: [] });
       });
 
       console.log('[PAGE LOADED]', pageNum, '— members so far:', allMembers.length);
@@ -166,9 +171,149 @@ async function extractMembers(page, orgName, browser) {
     name: m.handle,
     displayName: m.displayName || m.handle,
     handle: m.handle,
-    role: m.role || 'Member',
-    rank: m.role || 'Member',
+    orgType: m.orgType || 'main',
+    roles: [],
+    rank: '',
   }));
+
+  // Navigate to each profile page and extract HRVATSKA org data only
+  console.log(`[SCRAPER] Extracting ranks from ${members.length} profile pages...`);
+  for (const member of members) {
+    try {
+      await page.goto(`${RSI_HOME_URL}/citizens/${member.handle}`, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
+
+      // Inject shared helpers onto window so both evaluate calls can use them
+      await page.evaluate(() => {
+        window._isHrvatska = (text) => !!(text && (
+          text.includes('interstellar agency hrvatska') || text.includes('hrvatska')
+        ));
+        window._findHrvatskaCard = () => {
+          // Step 1: find elements whose text IS exactly the org name
+          const exactMatches = Array.from(document.querySelectorAll('div')).filter(el => {
+            const text = el.textContent?.toLowerCase().trim();
+            return text === 'interstellar agency hrvatska' || text === 'hrvatska';
+          });
+
+          // Step 2: climb up from each match until we reach a proper card container
+          for (const match of exactMatches) {
+            let current = match;
+            while (current && current !== document.body) {
+              const text = current.textContent?.toLowerCase();
+              // card must contain BOTH the org name AND "organization rank"
+              if (text && text.includes('organization rank') && window._isHrvatska(text)) {
+                return current;
+              }
+              current = current.parentElement;
+            }
+          }
+          return null;
+        };
+        window._extractRankFromCard = (card) => {
+          if (!card) return null;
+
+          // 1. Anchor to the exact "Organization Rank" label
+          const labelEl = Array.from(card.querySelectorAll('*'))
+            .find(el => el.textContent?.trim().toLowerCase() === 'organization rank');
+          if (!labelEl) return null;
+
+          // 2. Walk up until we find a block with multiple children (label + value row)
+          let container = labelEl.parentElement;
+          while (container && container.children.length <= 1) {
+            container = container.parentElement;
+          }
+          if (!container) return null;
+
+          function isValid(value) {
+            return value && value.length > 0 && value.length < 25 && /^[A-Za-z\s]+$/.test(value);
+          }
+
+          // 3. Value container is the next sibling block after the label's row
+          const valueContainer = container.nextElementSibling;
+
+          if (valueContainer) {
+            // 4. Extract only leaf nodes (deepest elements — no children)
+            const leafNodes = Array.from(valueContainer.querySelectorAll('*'))
+              .filter(node => node.children.length === 0);
+            for (const node of leafNodes) {
+              const value = node.textContent?.trim();
+              if (isValid(value)) return value;
+            }
+            // Fallback: valueContainer's own text
+            const fallback = valueContainer.textContent?.trim();
+            if (isValid(fallback)) return fallback;
+          }
+
+          // 5. Fallback for simpler structures — check siblings of the label inside container
+          for (const child of Array.from(container.children)) {
+            if (child === labelEl) continue;
+            const value = child.textContent?.trim();
+            if (isValid(value)) return value;
+          }
+
+          return null;
+        };
+        window._detectOrgType = (block) => {
+          let current = block;
+          while (current && current !== document.body) {
+            const text = current.textContent?.toLowerCase();
+            if (text) {
+              if (text.includes('affiliation')) return 'affiliate';
+              if (text.includes('main organization')) return 'main';
+            }
+            current = current.parentElement;
+          }
+          return 'main';
+        };
+      });
+
+      // ── STEP 1: Overview fast path (no tab click needed) ──────────────────
+      let result = await page.evaluate(() => {
+        const mainSection = Array.from(document.querySelectorAll('*'))
+          .find(el => el.textContent?.toLowerCase().includes('main organization'));
+        if (!mainSection) return null;
+        if (!window._isHrvatska(mainSection.textContent.toLowerCase())) return null;
+        return { orgType: 'main', finalRank: window._extractRankFromCard(mainSection) };
+      });
+
+      // ── STEP 2: Click Organizations tab, wait, then extract ────────────────
+      if (!result) {
+        const tabClicked = await page.evaluate(() => {
+          const tab = Array.from(document.querySelectorAll('*'))
+            .find(el => el.textContent?.toLowerCase().includes('organizations'));
+          if (tab) { tab.click(); return true; }
+          return false;
+        });
+        if (tabClicked) await page.waitForTimeout(800);
+
+        result = await page.evaluate(() => {
+          const orgBlock = window._findHrvatskaCard();
+          if (!orgBlock) return null;
+          console.log('[CARD VALIDATION]', {
+            containsRank: orgBlock.textContent.includes('Organization Rank'),
+            containsOrg: orgBlock.textContent.toLowerCase().includes('hrvatska'),
+          });
+          return {
+            orgType: window._detectOrgType(orgBlock),
+            finalRank: window._extractRankFromCard(orgBlock),
+          };
+        });
+      }
+
+      if (!result) result = { orgType: 'none', finalRank: null };
+
+      console.log('[RANK RESULT]', { handle: member.handle, orgType: result.orgType, extractedRank: result.finalRank });
+      if (!result.finalRank) {
+        console.log('[NULL RANK DEBUG]', { handle: member.handle, orgType: result.orgType });
+      }
+
+      if (result.orgType) member.orgType = result.orgType;
+      member.roles = result.finalRank ? [result.finalRank] : [];
+      member.rank = result.finalRank || '';
+      console.log('[RANK DEBUG]', { handle: member.handle, orgType: member.orgType, finalRank: result.finalRank });
+    } catch (err) {
+      console.warn(`[PROFILE RANK] ${member.handle} — ${err.message}`);
+    }
+  }
 
   console.log('[SCRAPER] Members found:', members.map((m) => m.handle));
   console.log('[SYNC] Proceeding with sync using', members.length, 'members');

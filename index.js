@@ -13,7 +13,7 @@ const { scrapeOrgMembers } = require('./scraper');
 const { load, setUser, getUser, getUserByHandle, removeUser } = require('./users');
 const { lockUser, unlockUser, isLocked } = require('./locked');
 const { blockUser, unblockUser, isBlocked, incrementAttempts } = require('./blocked');
-const { syncRoles, assignRoleToMember } = require('./roles');
+const { syncRoles, assignRoleToMember, syncMemberRoles, cleanupLegacyMemberRole } = require('./roles');
 const { findBestMatchRaw, similarity } = require('./fuzzy');
 const { runSync, scheduleWeeklySync } = require('./sync');
 const { updateNickname, addOptOut, removeOptOut } = require('./nicknames');
@@ -231,16 +231,17 @@ async function completeVerification(message, rsiHandle, orgMember) {
   if (orgMember && message.guild) {
     try {
       const discordMember = await message.guild.members.fetch(message.author.id);
-      const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
-
-      for (const rank of ranks) {
-        await assignRoleToMember(message.guild, discordMember, rank);
-      }
-
+      const userData = {
+        orgType: orgMember.orgType || 'main',
+        roles: orgMember.roles || [],
+      };
+      console.log('[SYNC ROLES INPUT]', { handle: rsiHandle, roles: userData.roles });
+      await syncMemberRoles(message.guild, discordMember, userData);
       await updateNickname(message.guild, discordMember, rsiHandle);
 
+      const orgTypeLabel = userData.orgType === 'affiliate' ? 'Affiliate' : 'Main Member';
       return message.reply(
-        `Verified! RSI handle \`${rsiHandle}\` linked and role(s) **${ranks.join(', ')}** assigned.`
+        `Verified! RSI handle \`${rsiHandle}\` linked. Type: **${orgTypeLabel}** | Roles: **${userData.roles.join(', ')}**`
       );
     } catch (err) {
       console.error('[verify] Role assignment failed:', err.message);
@@ -281,11 +282,12 @@ async function syncMembers(guild) {
       const nonOrgRole = guild.roles.cache.find((r) => r.name.toLowerCase() === 'non-org');
 
       if (orgMatch) {
-        // Org member — assign org role, remove non-org if present
-        const roleStr = orgMatch.role || orgMatch.rank || '';
-        for (const roleName of roleStr.split(',').map((r) => r.trim()).filter(Boolean)) {
-          await assignRoleToMember(guild, member, roleName).catch(() => {});
-        }
+        // Org member — full role sync, remove non-org if present
+        const userData = {
+          orgType: orgMatch.orgType || 'main',
+          roles: orgMatch.roles || [],
+        };
+        await syncMemberRoles(guild, member, userData).catch(() => {});
         if (nonOrgRole && member.roles.cache.has(nonOrgRole.id)) {
           await member.roles.remove(nonOrgRole);
           console.log(`[SYNC] Removed non-org role from org member ${handle}`);
@@ -320,6 +322,8 @@ client.once(Events.ClientReady, async (readyClient) => {
 
     const guild = await readyClient.guilds.fetch(config.guildId);
     await guild.roles.fetch();
+    await guild.members.fetch();
+    await cleanupLegacyMemberRole(guild);
     await syncRoles(guild, membersRef.members);
 
     scheduleWeeklySync(guild, membersRef, pendingDmConfirmations);
@@ -531,11 +535,11 @@ async function completeVerificationFromButton(interaction, handle) {
     const guildId = interaction.guildId || pendingOnboarding.get(userId)?.guildId || config.guildId;
     const guild = await client.guilds.fetch(guildId);
     const discordMember = await guild.members.fetch(userId);
-    const roleStr = (orgMember?.role || orgMember?.rank || '');
-    const ranks = roleStr.split(',').map((r) => r.trim()).filter(Boolean);
-    for (const rank of ranks) {
-      await assignRoleToMember(guild, discordMember, rank);
-    }
+    const userData = {
+      orgType: orgMember?.orgType || 'main',
+      roles: orgMember?.roles || [],
+    };
+    await syncMemberRoles(guild, discordMember, userData);
     await updateNickname(guild, discordMember, handle);
   } catch (err) {
     console.error('[onboard] Role/nickname update failed:', err.message);
@@ -672,15 +676,16 @@ client.on(Events.MessageCreate, async (message) => {
         try {
           const guild = await client.guilds.fetch(guildId);
           const discordMember = await guild.members.fetch(message.author.id);
-          const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
-
-          for (const rank of ranks) {
-            await assignRoleToMember(guild, discordMember, rank);
-          }
+          const userData = {
+            orgType: orgMember.orgType || 'main',
+            roles: orgMember.roles || [],
+          };
+          await syncMemberRoles(guild, discordMember, userData);
 
           console.log(`[dm-confirm] Confirmed: ${message.author.tag} → RSI: ${rsiHandle}`);
+          const orgTypeLabel = userData.orgType === 'affiliate' ? 'Affiliate' : 'Main Member';
           return message.reply(
-            `Verified! RSI handle \`${rsiHandle}\` linked and role(s) **${ranks.join(', ')}** assigned in the server.`
+            `Verified! RSI handle \`${rsiHandle}\` linked. Type: **${orgTypeLabel}** | Roles: **${userData.roles.join(', ')}**`
           );
         } catch (err) {
           console.error('[dm-confirm] Role assignment failed:', err.message);
@@ -970,10 +975,8 @@ client.on(Events.MessageCreate, async (message) => {
     setUser(mentioned.id, resolvedHandle);
     try {
       const discordMember = await message.guild.members.fetch(mentioned.id);
-      const ranks = orgMember.rank.split(',').map((r) => r.trim()).filter(Boolean);
-      for (const rank of ranks) {
-        await assignRoleToMember(message.guild, discordMember, rank);
-      }
+      const userData = { orgType: orgMember.orgType || 'main', roles: orgMember.roles || [] };
+      await syncMemberRoles(message.guild, discordMember, userData);
       await updateNickname(message.guild, discordMember, resolvedHandle);
     } catch (err) {
       console.error('[force] Role/nickname update failed:', err.message);
